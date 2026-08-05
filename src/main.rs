@@ -1,10 +1,14 @@
 mod cli;
 
 use clap::Parser;
-use cli::Cli;
+use cli::{Cli, Commands};
 
 fn main() {
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
 
-    println!("Wallman starting...");
+    match cli.command {
+        Commands::Set => {
+            println!("Setting wallpaper...");
+        }
+    }
 }
