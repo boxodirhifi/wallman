@@ -1,5 +1,17 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    process::Command,
+};
 
 pub fn set_wallpaper(image: &Path) {
-    println!("TODO: Set wallpaper with swaybg: {}", image.display());
+    // Kill existing swaybg instances.
+    let _ = Command::new("pkill")
+    .arg("swaybg")
+    .status();
+
+    // Start a new swaybg.
+    Command::new("swaybg")
+    .args(["-i", image.to_str().unwrap(), "-m", "fill"])
+    .spawn()
+    .expect("Failed to start swaybg");
 }
