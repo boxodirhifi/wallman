@@ -12,5 +12,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    Set,
+    Set {
+        image: std::path::PathBuf,
+    },
 }

@@ -7,8 +7,8 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Set => {
-            println!("Setting wallpaper...");
+        Commands::Set { image } => {
+            println!("Setting wallpaper: {}", image.display());
         }
     }
 }
