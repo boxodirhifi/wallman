@@ -1,4 +1,5 @@
 mod cli;
+mod commands;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -8,12 +9,7 @@ fn main() {
 
     match cli.command {
         Commands::Set { image } => {
-            if !image.exists() {
-                eprintln!("Error: '{}' does not exist.", image.display());
-                std::process::exit(1);
-            }
-
-            println!("Setting wallpaper: {}", image.display());
+            commands::set::run(image);
         }
     }
 }
