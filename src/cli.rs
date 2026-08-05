@@ -15,4 +15,6 @@ pub enum Commands {
     Set {
         image: std::path::PathBuf,
     },
+
+    Daemon,
 }

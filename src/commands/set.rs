@@ -19,5 +19,7 @@ pub fn run(image: PathBuf) {
     fs::copy(&image, &cached_wallpaper)
     .expect("Failed to copy wallpaper into cache");
 
-    crate::backend::swaybg::set_wallpaper(&cached_wallpaper);
+    crate::ipc::send_command(
+        cached_wallpaper.to_str().unwrap()
+    );
 }
