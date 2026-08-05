@@ -14,7 +14,7 @@ pub fn run(image: PathBuf) {
 
     fs::create_dir_all(cache_dir).expect("Failed to create cache directory");
 
-    let cached_wallpaper = cache_dir.join("current");
+    let cached_wallpaper = cache_dir.join("current.png");
 
     fs::copy(&image, &cached_wallpaper)
     .expect("Failed to copy wallpaper into cache");
