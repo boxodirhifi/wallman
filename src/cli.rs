@@ -31,4 +31,13 @@ pub enum Commands {
 
     #[command(about = "Run the wallpaper daemon")]
     Daemon,
+
+    #[command(about = "Show daemon status")]
+    Status,
+
+    #[command(about = "Reload current wallpaper")]
+    Reload,
+
+    #[command(about = "Stop daemon")]
+    Stop,
 }

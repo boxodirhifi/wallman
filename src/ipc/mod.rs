@@ -30,16 +30,14 @@ pub fn create_listener() -> UnixListener {
     listener
 }
 
-pub fn serve<F>(
-    listener: UnixListener,
-    mut handler: F,
-)
+pub fn serve<F>(listener: UnixListener, mut handler: F)
 where
-F: FnMut(String),
+F: FnMut(String) + 'static,
 {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+
                 let reader = BufReader::new(stream);
 
                 for line in reader.lines() {
@@ -59,10 +57,10 @@ F: FnMut(String),
 pub fn send_command(command: &str) {
     let socket = socket_path();
 
-    let mut stream = UnixStream::connect(&socket)
+    let mut stream =
+    UnixStream::connect(&socket)
     .expect("Could not connect to wallman daemon");
 
-    stream
-    .write_all(command.as_bytes())
+    writeln!(stream, "{command}")
     .expect("Failed to send command");
 }

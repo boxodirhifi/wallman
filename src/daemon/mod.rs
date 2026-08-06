@@ -51,19 +51,41 @@ impl Daemon {
         ipc::serve(listener, move |command| {
             println!("Daemon received: {}", command);
 
-            let mut parts = command.splitn(2, '|');
+            let mut parts = command.split('|');
 
-            let image = parts.next().unwrap();
-            let mode = parts.next().unwrap();
+            let action = parts.next();
 
-            let mut controller = controller
-            .lock()
-            .expect("Failed to lock controller");
+            match action {
+                Some("SET") => {
+                    let image = parts.next().unwrap();
+                    let mode = parts.next().unwrap_or(&config.mode);
 
-            controller.set_wallpaper(
-                std::path::Path::new(image),
-                mode,
-            );
+                    let mut controller = controller
+                    .lock()
+                    .expect("Failed to lock controller");
+
+                    controller.set_wallpaper(
+                        std::path::Path::new(image),
+                                             mode,
+                    );
+                }
+
+                Some("RELOAD") => {
+                    if cached_wallpaper.exists() {
+                        let mut controller = controller
+                        .lock()
+                        .expect("Failed to lock controller");
+
+                        controller.set_wallpaper(
+                            &cached_wallpaper,
+                            &config.mode,
+                        );
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown command");
+                }
+            }
         });
     }
 }

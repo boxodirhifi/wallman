@@ -26,7 +26,7 @@ pub fn run(
     .expect("Failed to copy wallpaper into cache");
 
     let command = format!(
-        "{}|{}",
+        "SET|{}|{}",
         cached_wallpaper.display(),
                           mode,
     );

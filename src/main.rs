@@ -20,5 +20,17 @@ fn main() {
             let mut daemon = daemon::Daemon::new();
             daemon.run();
         }
+
+        Commands::Status => {
+            commands::status::run();
+        }
+
+        Commands::Reload => {
+            commands::reload::run();
+        }
+
+        Commands::Stop => {
+            commands::stop::run();
+        }
     }
 }
