@@ -1,25 +1,41 @@
 use std::{
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
 };
 
-pub fn stop_existing() {
-    let _ = Command::new("pkill")
-    .arg("swaybg")
-    .status();
+use super::WallpaperBackend;
+
+pub struct SwaybgBackend {
+    process: Option<Child>,
 }
 
-pub fn start_wallpaper(
-    image: &Path,
-    mode: &str,
-) -> Child {
-    Command::new("swaybg")
-    .arg("-i")
-    .arg(image)
-    .arg("-m")
-    .arg(mode)
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()
-    .expect("Failed to start swaybg")
+impl SwaybgBackend {
+    pub fn new() -> Self {
+        Self {
+            process: None,
+        }
+    }
+}
+
+impl WallpaperBackend for SwaybgBackend {
+
+    fn set(&mut self, image: &Path, mode: &str) {
+        self.stop();
+
+        let child = Command::new("swaybg")
+        .arg("-i")
+        .arg(image)
+        .arg("-m")
+        .arg(mode)
+        .spawn()
+        .expect("Failed to start swaybg");
+
+        self.process = Some(child);
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut process) = self.process.take() {
+            let _ = process.kill();
+        }
+    }
 }

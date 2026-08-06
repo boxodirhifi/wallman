@@ -1,18 +1,16 @@
 use std::path::Path;
 
-use super::{
-    process::ProcessManager,
-    swaybg,
-};
+use super::WallpaperBackend;
 
 pub struct WallpaperController {
-    manager: ProcessManager,
+    backend: Box<dyn WallpaperBackend>,
 }
 
 impl WallpaperController {
-    pub fn new() -> Self {
+
+    pub fn new(backend: Box<dyn WallpaperBackend>) -> Self {
         Self {
-            manager: ProcessManager::new(),
+            backend,
         }
     }
 
@@ -21,7 +19,6 @@ impl WallpaperController {
         image: &Path,
         mode: &str,
     ) {
-        let child = swaybg::start_wallpaper(image, mode);
-        self.manager.replace(child);
+        self.backend.set(image, mode);
     }
 }

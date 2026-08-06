@@ -8,19 +8,28 @@ use crate::{
 
 pub struct Daemon {
     controller: Arc<Mutex<WallpaperController>>,
+    config: crate::config::Config,
 }
 
 impl Daemon {
     pub fn new() -> Self {
-        Self {
-            controller: Arc::new(Mutex::new(WallpaperController::new())),
-        }
-    }
-    pub fn run(&mut self) {
-        let listener = ipc::create_listener();
         let config = crate::config::load();
 
-        crate::backend::swaybg::stop_existing();
+        let backend =
+        crate::backend::factory::create_backend(&config.backend);
+
+        Self {
+            controller: Arc::new(
+                Mutex::new(
+                    WallpaperController::new(backend),
+                ),
+            ),
+            config,
+        }
+    }
+
+    pub fn run(&mut self) {
+        let listener = ipc::create_listener();
 
         let project_dirs =
         ProjectDirs::from("", "", "wallman")
@@ -31,6 +40,9 @@ impl Daemon {
 
         let controller = Arc::clone(&self.controller);
 
+        // Clone values needed by the IPC closure.
+        let default_mode = self.config.mode.clone();
+
         if cached_wallpaper.exists() {
             println!("Restoring cached wallpaper...");
 
@@ -40,25 +52,22 @@ impl Daemon {
 
             controller.set_wallpaper(
                 &cached_wallpaper,
-                &config.mode,
+                &default_mode,
             );
         }
 
         println!("wallman daemon started");
 
-
-
         ipc::serve(listener, move |command| {
             println!("Daemon received: {}", command);
 
             let mut parts = command.split('|');
-
             let action = parts.next();
 
             match action {
                 Some("SET") => {
                     let image = parts.next().unwrap();
-                    let mode = parts.next().unwrap_or(&config.mode);
+                    let mode = parts.next().unwrap_or(&default_mode);
 
                     let mut controller = controller
                     .lock()
@@ -78,10 +87,11 @@ impl Daemon {
 
                         controller.set_wallpaper(
                             &cached_wallpaper,
-                            &config.mode,
+                            &default_mode,
                         );
                     }
                 }
+
                 _ => {
                     eprintln!("Unknown command");
                 }
