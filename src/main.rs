@@ -3,6 +3,7 @@ mod commands;
 mod backend;
 mod daemon;
 mod ipc;
+mod config;
 
 use clap::Parser;
 use cli::{Cli, Commands};

@@ -16,8 +16,12 @@ impl WallpaperController {
         }
     }
 
-    pub fn set_wallpaper(&mut self, image: &Path) {
-        let child = swaybg::start_wallpaper(image);
+    pub fn set_wallpaper(
+        &mut self,
+        image: &Path,
+        mode: &str,
+    ) {
+        let child = swaybg::start_wallpaper(image, mode);
         self.manager.replace(child);
     }
 }
