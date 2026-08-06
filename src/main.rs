@@ -12,8 +12,8 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Set { image } => {
-            commands::set::run(image);
+        Commands::Set { image, mode } => {
+            commands::set::run(image, mode);
         }
 
         Commands::Daemon => {

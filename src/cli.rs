@@ -14,6 +14,18 @@ pub struct Cli {
 pub enum Commands {
     Set {
         image: std::path::PathBuf,
+
+        #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new([
+            "fill",
+            "fit",
+            "stretch",
+            "center",
+            "tile",
+            ])
+        )]
+        mode: Option<String>,
     },
 
     Daemon,

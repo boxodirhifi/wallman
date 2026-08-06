@@ -46,16 +46,23 @@ impl Daemon {
 
         println!("wallman daemon started");
 
+
+
         ipc::serve(listener, move |command| {
             println!("Daemon received: {}", command);
+
+            let mut parts = command.splitn(2, '|');
+
+            let image = parts.next().unwrap();
+            let mode = parts.next().unwrap();
 
             let mut controller = controller
             .lock()
             .expect("Failed to lock controller");
 
             controller.set_wallpaper(
-                std::path::Path::new(&command),
-                &config.mode,
+                std::path::Path::new(image),
+                mode,
             );
         });
     }

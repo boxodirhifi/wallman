@@ -1,7 +1,13 @@
 use directories::ProjectDirs;
 use std::{fs, path::PathBuf};
 
-pub fn run(image: PathBuf) {
+pub fn run(
+    image: PathBuf,
+    mode: Option<String>,
+) {
+    let config = crate::config::load();
+
+    let mode = mode.unwrap_or(config.mode);
     if !image.exists() {
         eprintln!("Error: '{}' does not exist.", image.display());
         std::process::exit(1);
@@ -19,7 +25,11 @@ pub fn run(image: PathBuf) {
     fs::copy(&image, &cached_wallpaper)
     .expect("Failed to copy wallpaper into cache");
 
-    crate::ipc::send_command(
-        cached_wallpaper.to_str().unwrap()
+    let command = format!(
+        "{}|{}",
+        cached_wallpaper.display(),
+                          mode,
     );
+
+    crate::ipc::send_command(&command);
 }
