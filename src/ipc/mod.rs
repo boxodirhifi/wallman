@@ -2,22 +2,41 @@ use std::{
     fs,
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
+    path::PathBuf,
 };
 
-const SOCKET_PATH: &str = "/tmp/wallman.sock";
+pub fn socket_path() -> PathBuf {
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+    .expect("XDG_RUNTIME_DIR is not set");
 
-pub fn start_server<F>(mut handler: F)
+    PathBuf::from(runtime).join("wallman.sock")
+}
+
+pub fn create_listener() -> UnixListener {
+    let socket = socket_path();
+
+    if UnixStream::connect(&socket).is_ok() {
+        eprintln!("wallman is already running.");
+        std::process::exit(1);
+    }
+
+    let _ = fs::remove_file(&socket);
+
+    let listener = UnixListener::bind(&socket)
+    .expect("Failed to create socket");
+
+    println!("wallman IPC listening on {}", socket.display());
+
+    listener
+}
+
+pub fn serve<F>(
+    listener: UnixListener,
+    mut handler: F,
+)
 where
-    F: FnMut(String) + 'static,
+F: FnMut(String),
 {
-    let _ = fs::remove_file(SOCKET_PATH);
-
-    let listener =
-        UnixListener::bind(SOCKET_PATH)
-            .expect("Failed to create socket");
-
-    println!("wallman IPC listening on {}", SOCKET_PATH);
-
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -38,8 +57,9 @@ where
 }
 
 pub fn send_command(command: &str) {
-    let mut stream =
-    UnixStream::connect(SOCKET_PATH)
+    let socket = socket_path();
+
+    let mut stream = UnixStream::connect(&socket)
     .expect("Could not connect to wallman daemon");
 
     stream

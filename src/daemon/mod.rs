@@ -1,3 +1,4 @@
+use directories::ProjectDirs;
 use std::sync::{Arc, Mutex};
 
 use crate::{
@@ -16,9 +17,8 @@ impl Daemon {
         }
     }
     pub fn run(&mut self) {
-        use directories::ProjectDirs;
+        let listener = ipc::create_listener();
         let config = crate::config::load();
-        println!("wallman daemon started");
 
         crate::backend::swaybg::stop_existing();
 
@@ -44,7 +44,9 @@ impl Daemon {
             );
         }
 
-        ipc::start_server(move |command| {
+        println!("wallman daemon started");
+
+        ipc::serve(listener, move |command| {
             println!("Daemon received: {}", command);
 
             let mut controller = controller
