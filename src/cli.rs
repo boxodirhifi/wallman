@@ -41,7 +41,10 @@ pub enum Commands {
     #[command(about = "Stop daemon")]
     Stop,
 
-    #[command(about = "Manage configuration")]
+    #[command(
+    about = "Manage configuration",
+    visible_alias = "cfg"
+    )]
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
@@ -53,8 +56,17 @@ pub enum ConfigCommands {
     #[command(about = "Show current configuration")]
     Show,
 
+    #[command(about = "Modify configuration")]
+    Set {
+        #[command(subcommand)]
+        setting: ConfigSetCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigSetCommands {
     #[command(about = "Set default wallpaper mode")]
-    SetMode {
+    Mode {
         #[arg(value_parser = clap::builder::PossibleValuesParser::new([
         "fill",
         "fit",
@@ -66,7 +78,7 @@ pub enum ConfigCommands {
     },
 
     #[command(about = "Set wallpaper backend")]
-    SetBackend {
+    Backend {
         backend: String,
     },
 }
