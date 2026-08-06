@@ -12,6 +12,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    #[command(about = "Set a wallpaper")]
     Set {
         image: std::path::PathBuf,
 
@@ -23,10 +24,11 @@ pub enum Commands {
             "stretch",
             "center",
             "tile",
-            ])
+        ])
         )]
         mode: Option<String>,
     },
 
+    #[command(about = "Run the wallpaper daemon")]
     Daemon,
 }
