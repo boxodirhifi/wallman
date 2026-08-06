@@ -1,8 +1,8 @@
 use directories::ProjectDirs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     pub backend: String,
     pub mode: String,
@@ -34,4 +34,24 @@ pub fn load() -> Config {
 
         Err(_) => Config::default(),
     }
+}
+
+pub fn save(config: &Config) {
+    let project_dirs =
+    ProjectDirs::from("", "", "wallman")
+    .expect("Failed to determine config directory");
+
+    let config_dir = project_dirs.config_dir();
+
+    fs::create_dir_all(config_dir)
+    .expect("Failed to create config directory");
+
+    let config_path = config_dir.join("config.toml");
+
+    let contents =
+    toml::to_string_pretty(config)
+    .expect("Failed to serialize config");
+
+    fs::write(config_path, contents)
+    .expect("Failed to write config");
 }

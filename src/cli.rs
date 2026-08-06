@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "wallman",
-    about = "A lightweight Wayland wallpaper manager"
+name = "wallman",
+about = "A lightweight Wayland wallpaper manager"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -40,4 +40,33 @@ pub enum Commands {
 
     #[command(about = "Stop daemon")]
     Stop,
+
+    #[command(about = "Manage configuration")]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommands {
+    #[command(about = "Show current configuration")]
+    Show,
+
+    #[command(about = "Set default wallpaper mode")]
+    SetMode {
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new([
+        "fill",
+        "fit",
+        "stretch",
+        "center",
+        "tile",
+        ]))]
+        mode: String,
+    },
+
+    #[command(about = "Set wallpaper backend")]
+    SetBackend {
+        backend: String,
+    },
 }

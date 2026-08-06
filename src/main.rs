@@ -6,7 +6,7 @@ mod ipc;
 mod config;
 
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, ConfigCommands};
 
 fn main() {
     let cli = Cli::parse();
@@ -32,5 +32,23 @@ fn main() {
         Commands::Stop => {
             commands::stop::run();
         }
+
+        Commands::Config { command } => {
+            match command {
+                ConfigCommands::Show => {
+                    commands::config::show();
+                }
+
+                ConfigCommands::SetMode { mode } => {
+                    commands::config::set_mode(mode);
+                }
+
+                ConfigCommands::SetBackend { backend } => {
+                    commands::config::set_backend(backend);
+                }
+            }
+        }
+
     }
+
 }
