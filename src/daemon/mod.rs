@@ -56,8 +56,10 @@ impl Daemon {
             );
         }
 
-        thread::spawn(|| {
-            crate::renderer::run()
+        let renderer_image = std::path::PathBuf::from("test.ppm");
+
+        thread::spawn(move || {
+            crate::renderer::run(renderer_image)
             .expect("Renderer crashed");
         });
 

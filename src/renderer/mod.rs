@@ -2,7 +2,6 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use wayland_client::{
     protocol::{
@@ -22,12 +21,6 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
-
-static RELOAD: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_sigusr1(_: libc::c_int) {
-    RELOAD.store(true, Ordering::SeqCst);
-}
 
 struct State {
     compositor: Option<WlCompositor>,
@@ -97,18 +90,19 @@ fn read_ppm_token(
 }
 
 fn load_ppm(
-    path: &str,
+    path: impl AsRef<std::path::Path>,
     expected_width: u32,
     expected_height: u32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let path = path.as_ref();
     let data =
-    std::fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
     let mut pos = 0;
 
     let magic = read_ppm_token(&data, &mut pos)?;
     if magic != "P6" {
-        return Err(format!("{path} is not a binary P6 PPM file").into());
+        return Err(format!("{} is not a binary P6 PPM file", path.display()).into());
     }
 
     let width_token = read_ppm_token(&data, &mut pos)?;
@@ -120,18 +114,18 @@ fn load_ppm(
     let maxval: u32 = maxval_token.parse()?;
 
     if maxval != 255 {
-        return Err(format!("{path}: only maxval 255 is supported").into());
+        return Err(format!("{}: only maxval 255 is supported", path.display()).into());
     }
 
     if width != expected_width || height != expected_height {
         return Err(format!(
-            "{path} is {width}x{height}, but the layer surface is {expected_width}x{expected_height}; create an exact-size PPM"
+            "{} is {width}x{height}, but the layer surface is {expected_width}x{expected_height}; create an exact-size PPM", path.display()
         )
         .into());
     }
 
     if pos >= data.len() {
-        return Err(format!("{path}: missing PPM raster data").into());
+        return Err(format!("{}: missing PPM raster data", path.display()).into());
     }
 
     let mut raster_start = pos + 1;
@@ -149,7 +143,7 @@ fn load_ppm(
     .ok_or("PPM size overflow")?;
 
     if data.len() < raster_start + rgb_size {
-        return Err(format!("{path}: PPM raster data is too small").into());
+        return Err(format!("{}: PPM raster data is too small", path.display()).into());
     }
 
     let rgb = &data[raster_start..raster_start + rgb_size];
@@ -177,6 +171,7 @@ fn load_ppm(
 fn prepare_image(
     state: &mut State,
     qh: &QueueHandle<State>,
+    image: impl AsRef<std::path::Path>,
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -193,7 +188,7 @@ fn prepare_image(
 
     let stride_i32 = i32::try_from(stride)?;
 
-    let image_data = load_ppm("test.ppm", width, height)?;
+    let image_data = load_ppm(image.as_ref(), width, height)?;
 
     if image_data.len() != expected_size {
         return Err("loaded image data does not match the expected buffer size".into());
@@ -416,7 +411,9 @@ impl Dispatch<WlCallback, ()> for State {
     }
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(
+    image: impl AsRef<std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Wallman renderer started");
     let conn = Connection::connect_to_env()?;
     let display = conn.display();
@@ -546,25 +543,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("acknowledged configure serial={serial}");
     }
 
-    prepare_image(&mut state, &qh, width, height)?;
-    println!("drew initial image from test.ppm");
+    prepare_image(
+        &mut state,
+        &qh,
+        image.as_ref(),
+                  width,
+                  height,
+    )?;
+    println!(
+        "drew initial image from {}",
+        image.as_ref().display()
+    );
 
     event_queue.roundtrip(&mut state)?;
 
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        // Fixed the compiler warning for casting a function pointer
-        sa.sa_sigaction = handle_sigusr1 as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        if libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()) != 0 {
-            return Err("failed to set SIGUSR1 handler".into());
-        }
-    }
-
-    println!(
-        "running; send SIGUSR1 to pid {} to reload image; Ctrl+C to exit",
-        std::process::id()
-    );
+    println!("Backdrop renderer is running");
 
     loop {
         if state.closed {
@@ -573,16 +566,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         event_queue.dispatch_pending(&mut state)?;
         conn.flush()?;
-
-        if RELOAD.swap(false, Ordering::SeqCst) {
-            println!("reloading image...");
-            let w = state.width;
-            let h = state.height;
-            match prepare_image(&mut state, &qh, w, h) {
-                Ok(_) => println!("reloaded image from test.ppm"),
-                Err(e) => println!("failed to reload image: {e}"),
-            }
-        }
 
         if let Some(serial) = state.configure_serial.take() {
             if let Some(layer_surface) = state.layer_surface.as_ref() {
