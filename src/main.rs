@@ -4,6 +4,7 @@ mod backend;
 mod daemon;
 mod ipc;
 mod config;
+mod renderer;
 
 use clap::Parser;
 use cli::{Cli, Commands, ConfigCommands, ConfigSetCommands};
