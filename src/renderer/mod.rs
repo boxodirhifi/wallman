@@ -47,7 +47,7 @@ struct State {
 }
 
 fn create_shm_file(size: usize) -> Result<File, Box<dyn std::error::Error>> {
-    let name = CString::new("wallman-renderer-test")?;
+    let name = CString::new("wallman-backdrop")?;
 
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
 
@@ -469,7 +469,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("created wl_surface");
 
     let namespace = std::env::var("WALLMAN_NAMESPACE")
-    .unwrap_or_else(|_| String::from("wallman-renderer-test"));
+    .unwrap_or_else(|_| String::from("wallman-backdrop"));
 
     println!("using namespace: {namespace}");
 
@@ -495,7 +495,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     layer_surface.set_size(0, 0);
-    layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+
+    layer_surface.set_anchor(
+        Anchor::Top
+        | Anchor::Bottom
+        | Anchor::Left
+        | Anchor::Right,
+    );
+
+    layer_surface.set_exclusive_zone(-1);
+
+    layer_surface.set_keyboard_interactivity(
+        zwlr_layer_surface_v1::KeyboardInteractivity::None,
+    );
 
     state.layer_surface = Some(layer_surface);
     println!("created zwlr_layer_surface_v1");
