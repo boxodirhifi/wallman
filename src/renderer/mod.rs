@@ -416,7 +416,8 @@ impl Dispatch<WlCallback, ()> for State {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Wallman renderer started");
     let conn = Connection::connect_to_env()?;
     let display = conn.display();
 

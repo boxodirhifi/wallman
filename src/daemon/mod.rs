@@ -1,6 +1,6 @@
 use directories::ProjectDirs;
 use std::sync::{Arc, Mutex};
-
+use std::thread;
 use crate::{
     backend::controller::WallpaperController,
     ipc,
@@ -55,6 +55,11 @@ impl Daemon {
                 &default_mode,
             );
         }
+
+        thread::spawn(|| {
+            crate::renderer::run()
+            .expect("Renderer crashed");
+        });
 
         println!("wallman daemon started");
 
