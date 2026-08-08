@@ -76,9 +76,4 @@ pub enum ConfigSetCommands {
         ]))]
         mode: String,
     },
-
-    #[command(about = "Set wallpaper backend")]
-    Backend {
-        backend: String,
-    },
 }

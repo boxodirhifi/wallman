@@ -4,14 +4,12 @@ use std::fs;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
-    pub backend: String,
     pub mode: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            backend: "swaybg".into(),
             mode: "fill".into(),
         }
     }

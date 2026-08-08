@@ -1,13 +1,10 @@
 use directories::ProjectDirs;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use crate::{
-    backend::controller::WallpaperController,
     ipc,
 };
 
 pub struct Daemon {
-    controller: Arc<Mutex<WallpaperController>>,
     config: crate::config::Config,
 }
 
@@ -15,17 +12,7 @@ impl Daemon {
     pub fn new() -> Self {
         let config = crate::config::load();
 
-        let backend =
-        crate::backend::factory::create_backend(&config.backend);
-
-        Self {
-            controller: Arc::new(
-                Mutex::new(
-                    WallpaperController::new(backend),
-                ),
-            ),
-            config,
-        }
+        Self { config }
     }
 
     pub fn run(&mut self) {
@@ -38,22 +25,10 @@ impl Daemon {
         let cached_wallpaper =
         project_dirs.cache_dir().join("current.png");
 
-        let controller = Arc::clone(&self.controller);
-
-        // Clone values needed by the IPC closure.
         let default_mode = self.config.mode.clone();
 
         if cached_wallpaper.exists() {
             println!("Restoring cached wallpaper...");
-
-            let mut controller = controller
-            .lock()
-            .expect("Failed to lock controller");
-
-            controller.set_wallpaper(
-                &cached_wallpaper,
-                &default_mode,
-            );
         }
 
         let (renderer_sender, renderer_receiver) =
@@ -77,16 +52,8 @@ impl Daemon {
             match action {
                 Some("SET") => {
                     let image = parts.next().unwrap();
-                    let mode = parts.next().unwrap_or(&default_mode);
+                    let _mode = parts.next().unwrap_or(&default_mode);
 
-                    let mut controller = controller
-                    .lock()
-                    .expect("Failed to lock controller");
-
-                    controller.set_wallpaper(
-                        std::path::Path::new(image),
-                                             mode,
-                    );
 
                     renderer_sender
                     .send(crate::renderer::RendererCommand::SetWallpaper {
@@ -96,16 +63,7 @@ impl Daemon {
                 }
 
                 Some("RELOAD") => {
-                    if cached_wallpaper.exists() {
-                        let mut controller = controller
-                        .lock()
-                        .expect("Failed to lock controller");
-
-                        controller.set_wallpaper(
-                            &cached_wallpaper,
-                            &default_mode,
-                        );
-                    }
+                    println!("Wallpaper reload requested");
                 }
 
                 _ => {

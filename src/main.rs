@@ -1,6 +1,5 @@
 mod cli;
 mod commands;
-mod backend;
 mod daemon;
 mod ipc;
 mod config;
@@ -44,10 +43,6 @@ fn main() {
                     match setting {
                         ConfigSetCommands::Mode { mode } => {
                             commands::config::set_mode(mode);
-                        }
-
-                        ConfigSetCommands::Backend { backend } => {
-                            commands::config::set_backend(backend);
                         }
                     }
                 }
