@@ -56,10 +56,13 @@ impl Daemon {
             );
         }
 
+        let (renderer_sender, renderer_receiver) =
+        std::sync::mpsc::channel();
+
         let renderer_image = cached_wallpaper.clone();
 
         thread::spawn(move || {
-            crate::renderer::run(renderer_image)
+            crate::renderer::run(renderer_image, renderer_receiver)
             .expect("Renderer crashed");
         });
 
@@ -84,6 +87,12 @@ impl Daemon {
                         std::path::Path::new(image),
                                              mode,
                     );
+
+                    renderer_sender
+                    .send(crate::renderer::RendererCommand::SetWallpaper {
+                        image: std::path::PathBuf::from(image),
+                    })
+                    .expect("Failed to send wallpaper update to renderer");
                 }
 
                 Some("RELOAD") => {

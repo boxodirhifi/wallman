@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::sync::mpsc::Receiver;
 
 use wayland_client::{
     protocol::{
@@ -22,6 +23,12 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
+pub enum RendererCommand {
+    SetWallpaper {
+        image: std::path::PathBuf,
+    },
+}
+
 struct State {
     compositor: Option<WlCompositor>,
     shm: Option<WlShm>,
@@ -32,6 +39,8 @@ struct State {
     pool: Option<WlShmPool>,
     buffer: Option<WlBuffer>,
     file: Option<File>,
+
+    buffer_released: bool,
 
     configure_serial: Option<u32>,
     width: u32,
@@ -150,6 +159,7 @@ fn prepare_image(
     state.pool = Some(pool);
     state.buffer = Some(buffer);
     state.file = Some(file);
+    state.buffer_released = false;
 
     Ok(())
 }
@@ -247,13 +257,17 @@ impl Dispatch<WlShmPool, ()> for State {
 
 impl Dispatch<WlBuffer, ()> for State {
     fn event(
-        _state: &mut State,
+        state: &mut State,
         _buffer: &WlBuffer,
-        _event: wl_buffer::Event,
+        event: wl_buffer::Event,
         _data: &(),
              _conn: &Connection,
              _qh: &QueueHandle<State>,
     ) {
+        if let wl_buffer::Event::Release = event {
+            state.buffer_released = true;
+            println!("Wayland released wallpaper buffer");
+        }
     }
 }
 
@@ -337,6 +351,7 @@ impl Dispatch<WlCallback, ()> for State {
 
 pub fn run(
     image: impl AsRef<std::path::Path>,
+    receiver: Receiver<RendererCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Wallman renderer started");
     let conn = Connection::connect_to_env()?;
@@ -356,6 +371,7 @@ pub fn run(
         pool: None,
         buffer: None,
         file: None,
+        buffer_released: true,
         configure_serial: None,
         width: 0,
         height: 0,
@@ -467,6 +483,14 @@ pub fn run(
         println!("acknowledged configure serial={serial}");
     }
 
+    if !state.buffer_released {
+        println!("Waiting for Wayland to release previous wallpaper buffer");
+
+        while !state.buffer_released {
+            event_queue.roundtrip(&mut state)?;
+        }
+    }
+
     prepare_image(
         &mut state,
         &qh,
@@ -486,6 +510,25 @@ pub fn run(
     loop {
         if state.closed {
             break;
+        }
+
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                RendererCommand::SetWallpaper { image } => {
+                    let width = state.width;
+                    let height = state.height;
+
+                    prepare_image(
+                        &mut state,
+                        &qh,
+                        &image,
+                        width,
+                        height,
+                    )?;
+
+                    println!("updated wallpaper from {}", image.display());
+                }
+            }
         }
 
         event_queue.dispatch_pending(&mut state)?;

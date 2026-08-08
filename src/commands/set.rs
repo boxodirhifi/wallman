@@ -24,26 +24,36 @@ pub fn run(
     .expect("Failed to create cache directory");
 
     let cached_wallpaper = cache_dir.join("current.png");
+    let temporary_wallpaper = cache_dir.join("current.png.tmp");
 
-    // Decode the source image and write a real PNG to the cache.
+    // Decode the source image and save it as PNG to a temporary file.
     let decoded = image::open(&image)
     .unwrap_or_else(|e| {
-        panic!(
-            "Failed to decode wallpaper '{}': {e}",
+        eprintln!(
+            "Error: failed to open '{}': {e}",
             image.display()
-        )
+        );
+        std::process::exit(1);
     });
 
-    decoded
-    .save_with_format(
-        &cached_wallpaper,
+    decoded.save_with_format(
+        &temporary_wallpaper,
         image::ImageFormat::Png,
     )
     .unwrap_or_else(|e| {
-        panic!(
-            "Failed to encode cached wallpaper '{}': {e}",
-            cached_wallpaper.display()
-        )
+        eprintln!(
+            "Error: failed to write cached wallpaper: {e}"
+        );
+        std::process::exit(1);
+    });
+
+    // Atomically replace the previous cache file.
+    fs::rename(&temporary_wallpaper, &cached_wallpaper)
+    .unwrap_or_else(|e| {
+        eprintln!(
+            "Error: failed to replace cached wallpaper: {e}"
+        );
+        std::process::exit(1);
     });
 
     println!(
