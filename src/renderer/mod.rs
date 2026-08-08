@@ -27,6 +27,7 @@ pub enum RendererCommand {
     SetWallpaper {
         image: std::path::PathBuf,
     },
+    Reload,
 }
 
 struct State {
@@ -514,6 +515,20 @@ pub fn run(
 
         while let Ok(command) = receiver.try_recv() {
             match command {
+                RendererCommand::Reload => {
+                    let width = state.width;
+                    let height = state.height;
+
+                    prepare_image(
+                        &mut state,
+                        &qh,
+                        &image,
+                        width,
+                        height,
+                    )?;
+
+                    println!("reloaded wallpaper from {}", image.as_ref().display());
+                }
                 RendererCommand::SetWallpaper { image } => {
                     let width = state.width;
                     let height = state.height;

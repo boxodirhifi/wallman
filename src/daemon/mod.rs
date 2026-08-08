@@ -63,7 +63,9 @@ impl Daemon {
                 }
 
                 Some("RELOAD") => {
-                    println!("Wallpaper reload requested");
+                    renderer_sender
+                    .send(crate::renderer::RendererCommand::Reload)
+                    .expect("Failed to send reload command to renderer");
                 }
 
                 _ => {
