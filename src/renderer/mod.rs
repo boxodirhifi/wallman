@@ -54,108 +54,32 @@ fn create_shm_file(size: usize) -> Result<File, Box<dyn std::error::Error>> {
     Ok(file)
 }
 
-fn read_ppm_token(
-    data: &[u8],
-    pos: &mut usize,
-) -> Result<String, Box<dyn std::error::Error>> {
-    loop {
-        while *pos < data.len() && data[*pos].is_ascii_whitespace() {
-            *pos += 1;
-        }
-
-        if *pos < data.len() && data[*pos] == b'#' {
-            while *pos < data.len() && data[*pos] != b'\n' {
-                *pos += 1;
-            }
-            continue;
-        }
-
-        break;
-    }
-
-    let start = *pos;
-
-    while *pos < data.len()
-        && !data[*pos].is_ascii_whitespace()
-        && data[*pos] != b'#'
-        {
-            *pos += 1;
-        }
-
-        if start == *pos {
-            return Err("unexpected end of PPM header".into());
-        }
-
-        Ok(String::from_utf8(data[start..*pos].to_vec())?)
-}
-
-fn load_ppm(
+fn load_image(
     path: impl AsRef<std::path::Path>,
     expected_width: u32,
     expected_height: u32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let path = path.as_ref();
-    let data =
-    std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
-    let mut pos = 0;
+    let image = image::open(path)
+    .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
 
-    let magic = read_ppm_token(&data, &mut pos)?;
-    if magic != "P6" {
-        return Err(format!("{} is not a binary P6 PPM file", path.display()).into());
-    }
+    let image = image.resize_to_fill(
+        expected_width,
+        expected_height,
+        image::imageops::FilterType::Lanczos3,
+    );
 
-    let width_token = read_ppm_token(&data, &mut pos)?;
-    let height_token = read_ppm_token(&data, &mut pos)?;
-    let maxval_token = read_ppm_token(&data, &mut pos)?;
-
-    let width: u32 = width_token.parse()?;
-    let height: u32 = height_token.parse()?;
-    let maxval: u32 = maxval_token.parse()?;
-
-    if maxval != 255 {
-        return Err(format!("{}: only maxval 255 is supported", path.display()).into());
-    }
-
-    if width != expected_width || height != expected_height {
-        return Err(format!(
-            "{} is {width}x{height}, but the layer surface is {expected_width}x{expected_height}; create an exact-size PPM", path.display()
-        )
-        .into());
-    }
-
-    if pos >= data.len() {
-        return Err(format!("{}: missing PPM raster data", path.display()).into());
-    }
-
-    let mut raster_start = pos + 1;
-
-    if data[pos] == b'\r' && raster_start < data.len() && data[raster_start] == b'\n' {
-        raster_start += 1;
-    }
-
-    let width_usize = usize::try_from(width)?;
-    let height_usize = usize::try_from(height)?;
-
-    let rgb_size = width_usize
-    .checked_mul(height_usize)
-    .and_then(|pixels| pixels.checked_mul(3))
-    .ok_or("PPM size overflow")?;
-
-    if data.len() < raster_start + rgb_size {
-        return Err(format!("{}: PPM raster data is too small", path.display()).into());
-    }
-
-    let rgb = &data[raster_start..raster_start + rgb_size];
+    let rgba = image.to_rgba8();
 
     let mut pixels = Vec::with_capacity(
-        width_usize
-        .checked_mul(height_usize)
+        usize::try_from(expected_width)?
+        .checked_mul(usize::try_from(expected_height)?)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or("XRGB buffer size overflow")?,
     );
 
-    for chunk in rgb.chunks_exact(3) {
+    for chunk in rgba.chunks_exact(4) {
         let r = chunk[0] as u32;
         let g = chunk[1] as u32;
         let b = chunk[2] as u32;
@@ -188,7 +112,7 @@ fn prepare_image(
 
     let stride_i32 = i32::try_from(stride)?;
 
-    let image_data = load_ppm(image.as_ref(), width, height)?;
+    let image_data = load_image(image.as_ref(), width, height)?;
 
     if image_data.len() != expected_size {
         return Err("loaded image data does not match the expected buffer size".into());

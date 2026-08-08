@@ -56,7 +56,7 @@ impl Daemon {
             );
         }
 
-        let renderer_image = std::path::PathBuf::from("test.ppm");
+        let renderer_image = cached_wallpaper.clone();
 
         thread::spawn(move || {
             crate::renderer::run(renderer_image)
