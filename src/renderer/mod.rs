@@ -30,29 +30,59 @@ pub enum RendererCommand {
     Reload,
 }
 
-struct State {
-    compositor: Option<WlCompositor>,
-    shm: Option<WlShm>,
-    layer_shell: Option<ZwlrLayerShellV1>,
+// ── Per-surface state ──────────────────────────────────────────────
+
+struct SurfaceState {
+    namespace: String,
     surface: Option<WlSurface>,
     layer_surface: Option<ZwlrLayerSurfaceV1>,
-
     pool: Option<WlShmPool>,
     buffer: Option<WlBuffer>,
     file: Option<File>,
-
     buffer_released: bool,
-
     configure_serial: Option<u32>,
     width: u32,
     height: u32,
     closed: bool,
 }
 
-fn create_shm_file(size: usize) -> Result<File, Box<dyn std::error::Error>> {
-    let name = CString::new("wallman-backdrop")?;
+impl SurfaceState {
+    fn new(namespace: &str) -> Self {
+        SurfaceState {
+            namespace: namespace.to_string(),
+            surface: None,
+            layer_surface: None,
+            pool: None,
+            buffer: None,
+            file: None,
+            buffer_released: true,
+            configure_serial: None,
+            width: 0,
+            height: 0,
+            closed: false,
+        }
+    }
+}
 
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+// ── Global state ───────────────────────────────────────────────────
+
+struct State {
+    compositor: Option<WlCompositor>,
+    shm: Option<WlShm>,
+    layer_shell: Option<ZwlrLayerShellV1>,
+    wallpaper: SurfaceState,
+    backdrop: SurfaceState,
+}
+
+// ── Helpers ────────────────────────────────────────────────────────
+
+fn create_shm_file(
+    name: &str,
+    size: usize,
+) -> Result<File, Box<dyn std::error::Error>> {
+    let cname = CString::new(name)?;
+
+    let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
 
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -103,7 +133,8 @@ fn load_image(
 }
 
 fn prepare_image(
-    state: &mut State,
+    ss: &mut SurfaceState,
+    shm: &WlShm,
     qh: &QueueHandle<State>,
     image: impl AsRef<std::path::Path>,
     width: u32,
@@ -128,16 +159,13 @@ fn prepare_image(
         return Err("loaded image data does not match the expected buffer size".into());
     }
 
-    let mut file = create_shm_file(expected_size)?;
+    let mut file = create_shm_file(&ss.namespace, expected_size)?;
     file.write_all(&image_data)?;
     file.flush()?;
 
     let size_i32 = i32::try_from(expected_size)?;
 
-    let pool: WlShmPool = {
-        let shm = state.shm.as_ref().ok_or("wl_shm not bound")?;
-        shm.create_pool(file.as_fd(), size_i32, qh, ())
-    };
+    let pool: WlShmPool = shm.create_pool(file.as_fd(), size_i32, qh, ());
 
     let buffer: WlBuffer = pool.create_buffer(
         0,
@@ -149,7 +177,7 @@ fn prepare_image(
         (),
     );
 
-    if let Some(surface) = state.surface.as_ref() {
+    if let Some(surface) = ss.surface.as_ref() {
         surface.attach(Some(&buffer), 0, 0);
         surface.damage_buffer(0, 0, width_i32, height_i32);
         surface.commit();
@@ -157,13 +185,15 @@ fn prepare_image(
         return Err("wl_surface not created".into());
     }
 
-    state.pool = Some(pool);
-    state.buffer = Some(buffer);
-    state.file = Some(file);
-    state.buffer_released = false;
+    ss.pool = Some(pool);
+    ss.buffer = Some(buffer);
+    ss.file = Some(file);
+    ss.buffer_released = false;
 
     Ok(())
 }
+
+// ── Dispatch implementations ───────────────────────────────────────
 
 impl Dispatch<WlRegistry, ()> for State {
     fn event(
@@ -180,34 +210,26 @@ impl Dispatch<WlRegistry, ()> for State {
                 interface,
                 version,
             } => {
-                println!("{name}: {interface} v{version}");
-
                 if interface == "wl_compositor" && state.compositor.is_none() {
                     let bind_version = version.min(6);
-
                     let compositor: WlCompositor =
                     registry.bind(name, bind_version, qh, ());
-
                     state.compositor = Some(compositor);
                     println!("bound: wl_compositor v{bind_version}");
                 }
 
                 if interface == "wl_shm" && state.shm.is_none() {
                     let bind_version = version.min(2);
-
                     let shm: WlShm =
                     registry.bind(name, bind_version, qh, ());
-
                     state.shm = Some(shm);
                     println!("bound: wl_shm v{bind_version}");
                 }
 
                 if interface == "zwlr_layer_shell_v1" && state.layer_shell.is_none() {
                     let bind_version = version.min(5);
-
                     let layer_shell: ZwlrLayerShellV1 =
                     registry.bind(name, bind_version, qh, ());
-
                     state.layer_shell = Some(layer_shell);
                     println!("bound: zwlr_layer_shell_v1 v{bind_version}");
                 }
@@ -259,15 +281,27 @@ impl Dispatch<WlShmPool, ()> for State {
 impl Dispatch<WlBuffer, ()> for State {
     fn event(
         state: &mut State,
-        _buffer: &WlBuffer,
+        buffer: &WlBuffer,
         event: wl_buffer::Event,
         _data: &(),
              _conn: &Connection,
              _qh: &QueueHandle<State>,
     ) {
         if let wl_buffer::Event::Release = event {
-            state.buffer_released = true;
-            println!("Wayland released wallpaper buffer");
+            let is_wallpaper = state
+            .wallpaper
+            .buffer
+            .as_ref()
+            .map(|b| b == buffer)
+            .unwrap_or(false);
+
+            if is_wallpaper {
+                state.wallpaper.buffer_released = true;
+                println!("[wallpaper] buffer released");
+            } else {
+                state.backdrop.buffer_released = true;
+                println!("[wallman-backdrop] buffer released");
+            }
         }
     }
 }
@@ -311,27 +345,42 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
     fn event(
         state: &mut State,
-        _layer_surface: &ZwlrLayerSurfaceV1,
+        layer_surface: &ZwlrLayerSurfaceV1,
         event: zwlr_layer_surface_v1::Event,
         _data: &(),
              _conn: &Connection,
              _qh: &QueueHandle<State>,
     ) {
+        let is_wallpaper = state
+        .wallpaper
+        .layer_surface
+        .as_ref()
+        .map(|ls| ls == layer_surface)
+        .unwrap_or(false);
+
+        let ss = if is_wallpaper {
+            &mut state.wallpaper
+        } else {
+            &mut state.backdrop
+        };
+
         match event {
             zwlr_layer_surface_v1::Event::Configure {
                 serial,
                 width,
                 height,
             } => {
-                println!("layer surface configure: serial={serial} width={width} height={height}");
-
-                state.configure_serial = Some(serial);
-                state.width = width;
-                state.height = height;
+                println!(
+                    "[{}] configure: serial={serial} width={width} height={height}",
+                    ss.namespace
+                );
+                ss.configure_serial = Some(serial);
+                ss.width = width;
+                ss.height = height;
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                println!("layer surface closed");
-                state.closed = true;
+                println!("[{}] layer surface closed", ss.namespace);
+                ss.closed = true;
             }
             _ => {}
         }
@@ -350,6 +399,8 @@ impl Dispatch<WlCallback, ()> for State {
     }
 }
 
+// ── Renderer entry point ───────────────────────────────────────────
+
 pub fn run(
     image: impl AsRef<std::path::Path>,
     receiver: Receiver<RendererCommand>,
@@ -367,16 +418,8 @@ pub fn run(
         compositor: None,
         shm: None,
         layer_shell: None,
-        surface: None,
-        layer_surface: None,
-        pool: None,
-        buffer: None,
-        file: None,
-        buffer_released: true,
-        configure_serial: None,
-        width: 0,
-        height: 0,
-        closed: false,
+        wallpaper: SurfaceState::new("wallpaper"),
+        backdrop: SurfaceState::new("wallman-backdrop"),
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -394,151 +437,263 @@ pub fn run(
         return Err("zwlr_layer_shell_v1 global not found".into());
     }
 
-    let surface: WlSurface = {
-        let compositor = state
-        .compositor
-        .as_ref()
-        .ok_or("wl_compositor not bound")?;
+    // ── Create wallpaper surface ───────────────────────────────────
+    {
+        let surface = {
+            let compositor = state
+            .compositor
+            .as_ref()
+            .ok_or("wl_compositor not bound")?;
+            compositor.create_surface(&qh, ())
+        };
+        state.wallpaper.surface = Some(surface);
+    }
+    {
+        let layer_surface = {
+            let layer_shell = state
+            .layer_shell
+            .as_ref()
+            .ok_or("zwlr_layer_shell_v1 not bound")?;
+            let surface = state
+            .wallpaper
+            .surface
+            .as_ref()
+            .ok_or("wallpaper wl_surface not created")?;
 
-        compositor.create_surface(&qh, ())
-    };
+            layer_shell.get_layer_surface(
+                surface,
+                None::<&WlOutput>,
+                zwlr_layer_shell_v1::Layer::Background,
+                state.wallpaper.namespace.clone(),
+                                          &qh,
+                                          (),
+            )
+        };
 
-    state.surface = Some(surface);
-    println!("created wl_surface");
+        layer_surface.set_size(0, 0);
+        layer_surface.set_anchor(
+            Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
+        );
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_keyboard_interactivity(
+            zwlr_layer_surface_v1::KeyboardInteractivity::None,
+        );
 
-    let namespace = std::env::var("WALLMAN_NAMESPACE")
-    .unwrap_or_else(|_| String::from("wallman-backdrop"));
+        state.wallpaper.layer_surface = Some(layer_surface);
+        println!("[wallpaper] created layer surface");
+    }
 
-    println!("using namespace: {namespace}");
+    // ── Create backdrop surface ────────────────────────────────────
+    {
+        let surface = {
+            let compositor = state
+            .compositor
+            .as_ref()
+            .ok_or("wl_compositor not bound")?;
+            compositor.create_surface(&qh, ())
+        };
+        state.backdrop.surface = Some(surface);
+    }
+    {
+        let layer_surface = {
+            let layer_shell = state
+            .layer_shell
+            .as_ref()
+            .ok_or("zwlr_layer_shell_v1 not bound")?;
+            let surface = state
+            .backdrop
+            .surface
+            .as_ref()
+            .ok_or("backdrop wl_surface not created")?;
 
-    let layer_surface: ZwlrLayerSurfaceV1 = {
-        let layer_shell = state
-        .layer_shell
-        .as_ref()
-        .ok_or("zwlr_layer_shell_v1 not bound")?;
+            layer_shell.get_layer_surface(
+                surface,
+                None::<&WlOutput>,
+                zwlr_layer_shell_v1::Layer::Background,
+                state.backdrop.namespace.clone(),
+                                          &qh,
+                                          (),
+            )
+        };
 
-        let surface = state
-        .surface
-        .as_ref()
-        .ok_or("wl_surface not created")?;
+        layer_surface.set_size(0, 0);
+        layer_surface.set_anchor(
+            Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
+        );
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_keyboard_interactivity(
+            zwlr_layer_surface_v1::KeyboardInteractivity::None,
+        );
 
-        layer_shell.get_layer_surface(
-            surface,
-            None::<&WlOutput>,
-            zwlr_layer_shell_v1::Layer::Background,
-            namespace,
-            &qh,
-            (),
-        )
-    };
+        state.backdrop.layer_surface = Some(layer_surface);
+        println!("[wallman-backdrop] created layer surface");
+    }
 
-    layer_surface.set_size(0, 0);
-
-    layer_surface.set_anchor(
-        Anchor::Top
-        | Anchor::Bottom
-        | Anchor::Left
-        | Anchor::Right,
-    );
-
-    layer_surface.set_exclusive_zone(-1);
-
-    layer_surface.set_keyboard_interactivity(
-        zwlr_layer_surface_v1::KeyboardInteractivity::None,
-    );
-
-    state.layer_surface = Some(layer_surface);
-    println!("created zwlr_layer_surface_v1");
+    // ── Commit both empty surfaces to trigger configure ────────────
+    if let Some(ref surface) = state.wallpaper.surface {
+        surface.commit();
+    }
+    if let Some(ref surface) = state.backdrop.surface {
+        surface.commit();
+    }
+    println!("committed empty surfaces to request configure");
 
     event_queue.roundtrip(&mut state)?;
 
-    if state.configure_serial.is_none() {
-        if let Some(surface) = state.surface.as_ref() {
-            surface.commit();
-            println!("committed empty wl_surface to request configure");
-        }
-
-        event_queue.roundtrip(&mut state)?;
-    }
-
+    // ── Wait for wallpaper configure ───────────────────────────────
     let mut attempts = 0;
-    while state.configure_serial.is_none() && attempts < 10 {
+    while state.wallpaper.configure_serial.is_none() && attempts < 10 {
         event_queue.roundtrip(&mut state)?;
         attempts += 1;
     }
 
-    let serial = state
+    let wp_serial = state
+    .wallpaper
     .configure_serial
     .take()
-    .ok_or("no configure event received")?;
+    .ok_or("[wallpaper] no configure event received")?;
+    let wp_width = state.wallpaper.width;
+    let wp_height = state.wallpaper.height;
 
-    let width = state.width;
-    let height = state.height;
-
-    if width == 0 || height == 0 {
-        return Err("configure event gave a zero size".into());
+    if wp_width == 0 || wp_height == 0 {
+        return Err("[wallpaper] configure event gave a zero size".into());
     }
 
-    if let Some(layer_surface) = state.layer_surface.as_ref() {
-        layer_surface.ack_configure(serial);
-        println!("acknowledged configure serial={serial}");
+    if let Some(ref ls) = state.wallpaper.layer_surface {
+        ls.ack_configure(wp_serial);
+        println!("[wallpaper] acknowledged configure serial={wp_serial}");
     }
 
-    if !state.buffer_released {
-        println!("Waiting for Wayland to release previous wallpaper buffer");
-
-        while !state.buffer_released {
-            event_queue.roundtrip(&mut state)?;
-        }
+    // ── Wait for backdrop configure ────────────────────────────────
+    let mut attempts = 0;
+    while state.backdrop.configure_serial.is_none() && attempts < 10 {
+        event_queue.roundtrip(&mut state)?;
+        attempts += 1;
     }
+
+    let bd_serial = state
+    .backdrop
+    .configure_serial
+    .take()
+    .ok_or("[wallman-backdrop] no configure event received")?;
+    let bd_width = state.backdrop.width;
+    let bd_height = state.backdrop.height;
+
+    if bd_width == 0 || bd_height == 0 {
+        return Err("[wallman-backdrop] configure event gave a zero size".into());
+    }
+
+    if let Some(ref ls) = state.backdrop.layer_surface {
+        ls.ack_configure(bd_serial);
+        println!("[wallman-backdrop] acknowledged configure serial={bd_serial}");
+    }
+
+    // ── Draw initial image on both surfaces ────────────────────────
+    let shm = state
+    .shm
+    .as_ref()
+    .ok_or("wl_shm not bound")?
+    .clone();
 
     prepare_image(
-        &mut state,
+        &mut state.wallpaper,
+        &shm,
         &qh,
         image.as_ref(),
-                  width,
-                  height,
+                  wp_width,
+                  wp_height,
     )?;
     println!(
-        "drew initial image from {}",
+        "[wallpaper] drew image from {}",
+        image.as_ref().display()
+    );
+
+    prepare_image(
+        &mut state.backdrop,
+        &shm,
+        &qh,
+        image.as_ref(),
+                  bd_width,
+                  bd_height,
+    )?;
+    println!(
+        "[wallman-backdrop] drew image from {}",
         image.as_ref().display()
     );
 
     event_queue.roundtrip(&mut state)?;
 
-    println!("Backdrop renderer is running");
+    println!("Wallman renderer is running (wallpaper + backdrop)");
 
+    // ── Event loop ─────────────────────────────────────────────────
     loop {
-        if state.closed {
+        if state.wallpaper.closed || state.backdrop.closed {
             break;
         }
 
         while let Ok(command) = receiver.try_recv() {
             match command {
                 RendererCommand::Reload => {
-                    let width = state.width;
-                    let height = state.height;
+                    let shm = state
+                    .shm
+                    .as_ref()
+                    .ok_or("wl_shm not bound")?
+                    .clone();
 
+                    let w = state.wallpaper.width;
+                    let h = state.wallpaper.height;
                     prepare_image(
-                        &mut state,
+                        &mut state.wallpaper,
+                        &shm,
                         &qh,
                         &image,
-                        width,
-                        height,
+                        w,
+                        h,
                     )?;
 
-                    println!("reloaded wallpaper from {}", image.as_ref().display());
-                }
-                RendererCommand::SetWallpaper { image } => {
-                    let width = state.width;
-                    let height = state.height;
-
+                    let w = state.backdrop.width;
+                    let h = state.backdrop.height;
                     prepare_image(
-                        &mut state,
+                        &mut state.backdrop,
+                        &shm,
                         &qh,
                         &image,
-                        width,
-                        height,
+                        w,
+                        h,
+                    )?;
+
+                    println!(
+                        "reloaded wallpaper from {}",
+                        image.as_ref().display()
+                    );
+                }
+                RendererCommand::SetWallpaper { image } => {
+                    let shm = state
+                    .shm
+                    .as_ref()
+                    .ok_or("wl_shm not bound")?
+                    .clone();
+
+                    let w = state.wallpaper.width;
+                    let h = state.wallpaper.height;
+                    prepare_image(
+                        &mut state.wallpaper,
+                        &shm,
+                        &qh,
+                        &image,
+                        w,
+                        h,
+                    )?;
+
+                    let w = state.backdrop.width;
+                    let h = state.backdrop.height;
+                    prepare_image(
+                        &mut state.backdrop,
+                        &shm,
+                        &qh,
+                        &image,
+                        w,
+                        h,
                     )?;
 
                     println!("updated wallpaper from {}", image.display());
@@ -549,10 +704,17 @@ pub fn run(
         event_queue.dispatch_pending(&mut state)?;
         conn.flush()?;
 
-        if let Some(serial) = state.configure_serial.take() {
-            if let Some(layer_surface) = state.layer_surface.as_ref() {
-                layer_surface.ack_configure(serial);
-                println!("acknowledged configure serial={serial}");
+        // Ack any pending configure events
+        if let Some(serial) = state.wallpaper.configure_serial.take() {
+            if let Some(ref ls) = state.wallpaper.layer_surface {
+                ls.ack_configure(serial);
+                println!("[wallpaper] acknowledged configure serial={serial}");
+            }
+        }
+        if let Some(serial) = state.backdrop.configure_serial.take() {
+            if let Some(ref ls) = state.backdrop.layer_surface {
+                ls.ack_configure(serial);
+                println!("[wallman-backdrop] acknowledged configure serial={serial}");
             }
         }
 
