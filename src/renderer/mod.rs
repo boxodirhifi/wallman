@@ -40,7 +40,6 @@ struct SurfaceState {
     pool: Option<WlShmPool>,
     buffer: Option<WlBuffer>,
     file: Option<File>,
-    buffer_released: bool,
     configure_serial: Option<u32>,
     width: u32,
     height: u32,
@@ -56,7 +55,6 @@ impl SurfaceState {
             pool: None,
             buffer: None,
             file: None,
-            buffer_released: true,
             configure_serial: None,
             width: 0,
             height: 0,
@@ -227,7 +225,6 @@ fn prepare_surface(
     ss.pool = Some(pool);
     ss.buffer = Some(buffer);
     ss.file = Some(file);
-    ss.buffer_released = false;
 
     Ok(())
 }
@@ -319,26 +316,18 @@ impl Dispatch<WlShmPool, ()> for State {
 
 impl Dispatch<WlBuffer, ()> for State {
     fn event(
-        state: &mut State,
-        buffer: &WlBuffer,
+        _state: &mut State,
+        _buffer: &WlBuffer,
         event: wl_buffer::Event,
         _data: &(),
              _conn: &Connection,
              _qh: &QueueHandle<State>,
     ) {
         if let wl_buffer::Event::Release = event {
-            let is_wallpaper = state
-            .wallpaper
-            .buffer
-            .as_ref()
-            .map(|b| b == buffer)
-            .unwrap_or(false);
-
-            if is_wallpaper {
-                state.wallpaper.buffer_released = true;
-            } else {
-                state.backdrop.buffer_released = true;
-            }
+            // Wayland has released the buffer.
+            // Since we overwrite ss.buffer in prepare_surface, the old
+            // WlBuffer proxy was already dropped (sending destroy).
+            // We don't need to track this state anymore.
         }
     }
 }
