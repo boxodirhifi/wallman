@@ -74,7 +74,66 @@ struct State {
     backdrop: SurfaceState,
 }
 
-// ── Helpers ────────────────────────────────────────────────────────
+// ── Image processing pipeline ──────────────────────────────────────
+
+struct ProcessedImages {
+    wallpaper_pixels: Vec<u8>,
+    backdrop_pixels: Vec<u8>,
+}
+
+fn rgba_to_xrgb(rgba: &image::RgbaImage) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity(rgba.len());
+
+    for chunk in rgba.chunks_exact(4) {
+        let r = chunk[0] as u32;
+        let g = chunk[1] as u32;
+        let b = chunk[2] as u32;
+
+        let pixel = (r << 16) | (g << 8) | b;
+        pixels.extend_from_slice(&pixel.to_ne_bytes());
+    }
+
+    pixels
+}
+
+fn process_image(
+    path: impl AsRef<std::path::Path>,
+    wp_width: u32,
+    wp_height: u32,
+    bd_width: u32,
+    bd_height: u32,
+) -> Result<ProcessedImages, Box<dyn std::error::Error>> {
+    let path = path.as_ref();
+
+    let image = image::open(path)
+    .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+
+    // ── Sharp wallpaper ────────────────────────────────────────────
+    let sharp_img = image.resize_to_fill(
+        wp_width,
+        wp_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let sharp_rgba = sharp_img.to_rgba8();
+    let wallpaper_pixels = rgba_to_xrgb(&sharp_rgba);
+
+    // ── Blurred backdrop ───────────────────────────────────────────
+    let backdrop_img = image.resize_to_fill(
+        bd_width,
+        bd_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let backdrop_rgba = backdrop_img.to_rgba8();
+    let blurred_rgba = image::imageops::blur(&backdrop_rgba, 8.0);
+    let backdrop_pixels = rgba_to_xrgb(&blurred_rgba);
+
+    Ok(ProcessedImages {
+        wallpaper_pixels,
+       backdrop_pixels,
+    })
+}
+
+// ── Wayland helpers ────────────────────────────────────────────────
 
 fn create_shm_file(
     name: &str,
@@ -94,49 +153,11 @@ fn create_shm_file(
     Ok(file)
 }
 
-fn load_image(
-    path: impl AsRef<std::path::Path>,
-    expected_width: u32,
-    expected_height: u32,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let path = path.as_ref();
-
-    let image = image::open(path)
-    .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-
-    let image = image.resize_to_fill(
-        expected_width,
-        expected_height,
-        image::imageops::FilterType::Lanczos3,
-    );
-
-    let rgba = image.to_rgba8();
-
-    let mut pixels = Vec::with_capacity(
-        usize::try_from(expected_width)?
-        .checked_mul(usize::try_from(expected_height)?)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or("XRGB buffer size overflow")?,
-    );
-
-    for chunk in rgba.chunks_exact(4) {
-        let r = chunk[0] as u32;
-        let g = chunk[1] as u32;
-        let b = chunk[2] as u32;
-
-        let pixel = (r << 16) | (g << 8) | b;
-
-        pixels.extend_from_slice(&pixel.to_ne_bytes());
-    }
-
-    Ok(pixels)
-}
-
-fn prepare_image(
+fn prepare_surface(
     ss: &mut SurfaceState,
     shm: &WlShm,
     qh: &QueueHandle<State>,
-    image: impl AsRef<std::path::Path>,
+    pixels: &[u8],
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -153,14 +174,12 @@ fn prepare_image(
 
     let stride_i32 = i32::try_from(stride)?;
 
-    let image_data = load_image(image.as_ref(), width, height)?;
-
-    if image_data.len() != expected_size {
-        return Err("loaded image data does not match the expected buffer size".into());
+    if pixels.len() != expected_size {
+        return Err("pixel data does not match the expected buffer size".into());
     }
 
     let mut file = create_shm_file(&ss.namespace, expected_size)?;
-    file.write_all(&image_data)?;
+    file.write_all(pixels)?;
     file.flush()?;
 
     let size_i32 = i32::try_from(expected_size)?;
@@ -297,10 +316,8 @@ impl Dispatch<WlBuffer, ()> for State {
 
             if is_wallpaper {
                 state.wallpaper.buffer_released = true;
-                println!("[wallpaper] buffer released");
             } else {
                 state.backdrop.buffer_released = true;
-                println!("[wallman-backdrop] buffer released");
             }
         }
     }
@@ -588,42 +605,50 @@ pub fn run(
         println!("[wallman-backdrop] acknowledged configure serial={bd_serial}");
     }
 
-    // ── Draw initial image on both surfaces ────────────────────────
+    // ── Process image once, draw to both surfaces ──────────────────
     let shm = state
     .shm
     .as_ref()
     .ok_or("wl_shm not bound")?
     .clone();
 
-    prepare_image(
+    let images = process_image(
+        image.as_ref(),
+                               wp_width,
+                               wp_height,
+                               bd_width,
+                               bd_height,
+    )?;
+
+    prepare_surface(
         &mut state.wallpaper,
         &shm,
         &qh,
-        image.as_ref(),
-                  wp_width,
-                  wp_height,
+        &images.wallpaper_pixels,
+        wp_width,
+        wp_height,
     )?;
     println!(
-        "[wallpaper] drew image from {}",
+        "[wallpaper] drew sharp image from {}",
         image.as_ref().display()
     );
 
-    prepare_image(
+    prepare_surface(
         &mut state.backdrop,
         &shm,
         &qh,
-        image.as_ref(),
-                  bd_width,
-                  bd_height,
+        &images.backdrop_pixels,
+        bd_width,
+        bd_height,
     )?;
     println!(
-        "[wallman-backdrop] drew image from {}",
+        "[wallman-backdrop] drew blurred image from {}",
         image.as_ref().display()
     );
 
     event_queue.roundtrip(&mut state)?;
 
-    println!("Wallman renderer is running (wallpaper + backdrop)");
+    println!("Wallman renderer is running (wallpaper + blurred backdrop)");
 
     // ── Event loop ─────────────────────────────────────────────────
     loop {
@@ -640,26 +665,28 @@ pub fn run(
                     .ok_or("wl_shm not bound")?
                     .clone();
 
-                    let w = state.wallpaper.width;
-                    let h = state.wallpaper.height;
-                    prepare_image(
+                    let wp_w = state.wallpaper.width;
+                    let wp_h = state.wallpaper.height;
+                    let bd_w = state.backdrop.width;
+                    let bd_h = state.backdrop.height;
+
+                    let images = process_image(&image, wp_w, wp_h, bd_w, bd_h)?;
+
+                    prepare_surface(
                         &mut state.wallpaper,
                         &shm,
                         &qh,
-                        &image,
-                        w,
-                        h,
+                        &images.wallpaper_pixels,
+                        wp_w,
+                        wp_h,
                     )?;
-
-                    let w = state.backdrop.width;
-                    let h = state.backdrop.height;
-                    prepare_image(
+                    prepare_surface(
                         &mut state.backdrop,
                         &shm,
                         &qh,
-                        &image,
-                        w,
-                        h,
+                        &images.backdrop_pixels,
+                        bd_w,
+                        bd_h,
                     )?;
 
                     println!(
@@ -674,26 +701,28 @@ pub fn run(
                     .ok_or("wl_shm not bound")?
                     .clone();
 
-                    let w = state.wallpaper.width;
-                    let h = state.wallpaper.height;
-                    prepare_image(
+                    let wp_w = state.wallpaper.width;
+                    let wp_h = state.wallpaper.height;
+                    let bd_w = state.backdrop.width;
+                    let bd_h = state.backdrop.height;
+
+                    let images = process_image(&image, wp_w, wp_h, bd_w, bd_h)?;
+
+                    prepare_surface(
                         &mut state.wallpaper,
                         &shm,
                         &qh,
-                        &image,
-                        w,
-                        h,
+                        &images.wallpaper_pixels,
+                        wp_w,
+                        wp_h,
                     )?;
-
-                    let w = state.backdrop.width;
-                    let h = state.backdrop.height;
-                    prepare_image(
+                    prepare_surface(
                         &mut state.backdrop,
                         &shm,
                         &qh,
-                        &image,
-                        w,
-                        h,
+                        &images.backdrop_pixels,
+                        bd_w,
+                        bd_h,
                     )?;
 
                     println!("updated wallpaper from {}", image.display());
