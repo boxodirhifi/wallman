@@ -35,9 +35,10 @@ impl Daemon {
         std::sync::mpsc::channel();
 
         let renderer_image = cached_wallpaper.clone();
+        let renderer_mode = default_mode.clone();
 
         thread::spawn(move || {
-            crate::renderer::run(renderer_image, renderer_receiver)
+            crate::renderer::run(renderer_image, renderer_mode, renderer_receiver)
             .expect("Renderer crashed");
         });
 
@@ -52,12 +53,12 @@ impl Daemon {
             match action {
                 Some("SET") => {
                     let image = parts.next().unwrap();
-                    let _mode = parts.next().unwrap_or(&default_mode);
-
+                    let mode = parts.next().unwrap_or(&default_mode);
 
                     renderer_sender
                     .send(crate::renderer::RendererCommand::SetWallpaper {
                         image: std::path::PathBuf::from(image),
+                          mode: mode.to_string(),
                     })
                     .expect("Failed to send wallpaper update to renderer");
                 }

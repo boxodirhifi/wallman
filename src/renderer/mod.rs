@@ -26,6 +26,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 pub enum RendererCommand {
     SetWallpaper {
         image: std::path::PathBuf,
+        mode: String,
     },
     Reload,
 }
@@ -72,6 +73,7 @@ struct State {
     layer_shell: Option<ZwlrLayerShellV1>,
     wallpaper: SurfaceState,
     backdrop: SurfaceState,
+    current_mode: String,
 }
 
 // ── Image processing pipeline ──────────────────────────────────────
@@ -98,6 +100,7 @@ fn rgba_to_xrgb(rgba: &image::RgbaImage) -> Vec<u8> {
 
 fn process_image(
     path: impl AsRef<std::path::Path>,
+    mode: &str,
     wp_width: u32,
     wp_height: u32,
     bd_width: u32,
@@ -108,22 +111,39 @@ fn process_image(
     let image = image::open(path)
     .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
 
+    let resize = |img: &image::DynamicImage, w: u32, h: u32| -> image::RgbaImage {
+        match mode {
+            "fit" => {
+                let resized = img.resize(w, h, image::imageops::FilterType::Lanczos3).to_rgba8();
+                let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
+                let x = (w.saturating_sub(resized.width())) / 2;
+                let y = (h.saturating_sub(resized.height())) / 2;
+                image::imageops::overlay(&mut bg, &resized, x as i64, y as i64);
+                bg
+            }
+            "stretch" => {
+                img.resize_exact(w, h, image::imageops::FilterType::Lanczos3).to_rgba8()
+            }
+            "center" => {
+                let resized = img.to_rgba8();
+                let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
+                let x = (w as i32 - resized.width() as i32) / 2;
+                let y = (h as i32 - resized.height() as i32) / 2;
+                image::imageops::overlay(&mut bg, &resized, x as i64, y as i64);
+                bg
+            }
+            _ => { // "fill" or unknown
+                img.resize_to_fill(w, h, image::imageops::FilterType::Lanczos3).to_rgba8()
+            }
+        }
+    };
+
     // ── Sharp wallpaper ────────────────────────────────────────────
-    let sharp_img = image.resize_to_fill(
-        wp_width,
-        wp_height,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let sharp_rgba = sharp_img.to_rgba8();
+    let sharp_rgba = resize(&image, wp_width, wp_height);
     let wallpaper_pixels = rgba_to_xrgb(&sharp_rgba);
 
     // ── Blurred backdrop ───────────────────────────────────────────
-    let backdrop_img = image.resize_to_fill(
-        bd_width,
-        bd_height,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let backdrop_rgba = backdrop_img.to_rgba8();
+    let backdrop_rgba = resize(&image, bd_width, bd_height);
     let blurred_rgba = image::imageops::blur(&backdrop_rgba, 8.0);
     let backdrop_pixels = rgba_to_xrgb(&blurred_rgba);
 
@@ -420,6 +440,7 @@ impl Dispatch<WlCallback, ()> for State {
 
 pub fn run(
     image: impl AsRef<std::path::Path>,
+    initial_mode: String,
     receiver: Receiver<RendererCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Wallman renderer started");
@@ -437,6 +458,7 @@ pub fn run(
         layer_shell: None,
         wallpaper: SurfaceState::new("wallpaper"),
         backdrop: SurfaceState::new("wallman-backdrop"),
+        current_mode: initial_mode,
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -614,6 +636,7 @@ pub fn run(
 
     let images = process_image(
         image.as_ref(),
+                               &state.current_mode,
                                wp_width,
                                wp_height,
                                bd_width,
@@ -629,8 +652,9 @@ pub fn run(
         wp_height,
     )?;
     println!(
-        "[wallpaper] drew sharp image from {}",
-        image.as_ref().display()
+        "[wallpaper] drew sharp image from {} (mode: {})",
+             image.as_ref().display(),
+             state.current_mode
     );
 
     prepare_surface(
@@ -642,8 +666,9 @@ pub fn run(
         bd_height,
     )?;
     println!(
-        "[wallman-backdrop] drew blurred image from {}",
-        image.as_ref().display()
+        "[wallman-backdrop] drew blurred image from {} (mode: {})",
+             image.as_ref().display(),
+             state.current_mode
     );
 
     event_queue.roundtrip(&mut state)?;
@@ -670,7 +695,7 @@ pub fn run(
                     let bd_w = state.backdrop.width;
                     let bd_h = state.backdrop.height;
 
-                    let images = process_image(&image, wp_w, wp_h, bd_w, bd_h)?;
+                    let images = process_image(&image, &state.current_mode, wp_w, wp_h, bd_w, bd_h)?;
 
                     prepare_surface(
                         &mut state.wallpaper,
@@ -690,11 +715,13 @@ pub fn run(
                     )?;
 
                     println!(
-                        "reloaded wallpaper from {}",
-                        image.as_ref().display()
+                        "reloaded wallpaper from {} (mode: {})",
+                             image.as_ref().display(),
+                             state.current_mode
                     );
                 }
-                RendererCommand::SetWallpaper { image } => {
+                RendererCommand::SetWallpaper { image, mode } => {
+                    state.current_mode = mode;
                     let shm = state
                     .shm
                     .as_ref()
@@ -706,7 +733,7 @@ pub fn run(
                     let bd_w = state.backdrop.width;
                     let bd_h = state.backdrop.height;
 
-                    let images = process_image(&image, wp_w, wp_h, bd_w, bd_h)?;
+                    let images = process_image(&image, &state.current_mode, wp_w, wp_h, bd_w, bd_h)?;
 
                     prepare_surface(
                         &mut state.wallpaper,
@@ -725,7 +752,7 @@ pub fn run(
                         bd_h,
                     )?;
 
-                    println!("updated wallpaper from {}", image.display());
+                    println!("updated wallpaper from {} (mode: {})", image.display(), state.current_mode);
                 }
             }
         }
