@@ -627,7 +627,7 @@ pub fn run(
         println!("[wallman-backdrop] acknowledged configure serial={bd_serial}");
     }
 
-    // ── Process image once, draw to both surfaces ──────────────────
+    // ── Process initial image (strict: crash if cached image is bad) ──
     let shm = state
     .shm
     .as_ref()
@@ -684,75 +684,110 @@ pub fn run(
         while let Ok(command) = receiver.try_recv() {
             match command {
                 RendererCommand::Reload => {
-                    let shm = state
-                    .shm
-                    .as_ref()
-                    .ok_or("wl_shm not bound")?
-                    .clone();
+                    let shm = match state.shm.as_ref() {
+                        Some(s) => s.clone(),
+                        None => {
+                            eprintln!("Failed to reload: wl_shm not bound");
+                            continue;
+                        }
+                    };
 
                     let wp_w = state.wallpaper.width;
                     let wp_h = state.wallpaper.height;
                     let bd_w = state.backdrop.width;
                     let bd_h = state.backdrop.height;
 
-                    let images = process_image(&image, &state.current_mode, wp_w, wp_h, bd_w, bd_h)?;
+                    match process_image(&image, &state.current_mode, wp_w, wp_h, bd_w, bd_h) {
+                        Ok(images) => {
+                            if let Err(e) = prepare_surface(
+                                &mut state.wallpaper,
+                                &shm,
+                                &qh,
+                                &images.wallpaper_pixels,
+                                wp_w,
+                                wp_h,
+                            ) {
+                                eprintln!("Failed to prepare wallpaper surface: {e}");
+                                continue;
+                            }
+                            if let Err(e) = prepare_surface(
+                                &mut state.backdrop,
+                                &shm,
+                                &qh,
+                                &images.backdrop_pixels,
+                                bd_w,
+                                bd_h,
+                            ) {
+                                eprintln!("Failed to prepare backdrop surface: {e}");
+                                continue;
+                            }
 
-                    prepare_surface(
-                        &mut state.wallpaper,
-                        &shm,
-                        &qh,
-                        &images.wallpaper_pixels,
-                        wp_w,
-                        wp_h,
-                    )?;
-                    prepare_surface(
-                        &mut state.backdrop,
-                        &shm,
-                        &qh,
-                        &images.backdrop_pixels,
-                        bd_w,
-                        bd_h,
-                    )?;
-
-                    println!(
-                        "reloaded wallpaper from {} (mode: {})",
-                             image.as_ref().display(),
-                             state.current_mode
-                    );
+                            println!(
+                                "reloaded wallpaper from {} (mode: {})",
+                                     image.as_ref().display(),
+                                     state.current_mode
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to reload image {}: {e}",
+                                image.as_ref().display()
+                            );
+                        }
+                    }
                 }
                 RendererCommand::SetWallpaper { image, mode } => {
-                    state.current_mode = mode;
-                    let shm = state
-                    .shm
-                    .as_ref()
-                    .ok_or("wl_shm not bound")?
-                    .clone();
+                    let shm = match state.shm.as_ref() {
+                        Some(s) => s.clone(),
+                        None => {
+                            eprintln!("Failed to set wallpaper: wl_shm not bound");
+                            continue;
+                        }
+                    };
 
                     let wp_w = state.wallpaper.width;
                     let wp_h = state.wallpaper.height;
                     let bd_w = state.backdrop.width;
                     let bd_h = state.backdrop.height;
 
-                    let images = process_image(&image, &state.current_mode, wp_w, wp_h, bd_w, bd_h)?;
+                    match process_image(&image, &mode, wp_w, wp_h, bd_w, bd_h) {
+                        Ok(images) => {
+                            if let Err(e) = prepare_surface(
+                                &mut state.wallpaper,
+                                &shm,
+                                &qh,
+                                &images.wallpaper_pixels,
+                                wp_w,
+                                wp_h,
+                            ) {
+                                eprintln!("Failed to prepare wallpaper surface: {e}");
+                                continue;
+                            }
+                            if let Err(e) = prepare_surface(
+                                &mut state.backdrop,
+                                &shm,
+                                &qh,
+                                &images.backdrop_pixels,
+                                bd_w,
+                                bd_h,
+                            ) {
+                                eprintln!("Failed to prepare backdrop surface: {e}");
+                                continue;
+                            }
 
-                    prepare_surface(
-                        &mut state.wallpaper,
-                        &shm,
-                        &qh,
-                        &images.wallpaper_pixels,
-                        wp_w,
-                        wp_h,
-                    )?;
-                    prepare_surface(
-                        &mut state.backdrop,
-                        &shm,
-                        &qh,
-                        &images.backdrop_pixels,
-                        bd_w,
-                        bd_h,
-                    )?;
+                            // Only update mode after successful draw
+                            state.current_mode = mode;
 
-                    println!("updated wallpaper from {} (mode: {})", image.display(), state.current_mode);
+                            println!(
+                                "updated wallpaper from {} (mode: {})",
+                                     image.display(),
+                                     state.current_mode
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to process image {}: {e}", image.display());
+                        }
+                    }
                 }
             }
         }
