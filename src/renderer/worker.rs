@@ -5,9 +5,13 @@ use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::collections::HashMap;
 
 #[derive(Clone)]
-pub struct MonitorConfig {
+pub struct MonitorJob {
+    pub name: String,
+    pub path: PathBuf,
+    pub mode: String,
     pub wp_width: u32,
     pub wp_height: u32,
     pub bd_width: u32,
@@ -15,23 +19,24 @@ pub struct MonitorConfig {
 }
 
 pub struct MonitorResult {
+    pub name: String,
     pub wallpaper_file: File,
     pub backdrop_file: File,
-    pub config: MonitorConfig,
+    pub wp_width: u32,
+    pub wp_height: u32,
+    pub bd_width: u32,
+    pub bd_height: u32,
 }
 
 pub enum WorkerCommand {
     Process {
-        path: PathBuf,
-        mode: String,
-        monitors: Vec<MonitorConfig>,
+        jobs: Vec<MonitorJob>,
     },
 }
 
 pub enum WorkerResponse {
     Ready {
         colors: Vec<(u8, u8, u8)>,
-        mode: String,
         monitors: Vec<MonitorResult>,
     },
     Failed(String),
@@ -44,12 +49,11 @@ pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResp
     thread::spawn(move || {
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
-                WorkerCommand::Process { path, mode, monitors } => {
-                    match process_images(&path, &mode, &monitors) {
+                WorkerCommand::Process { jobs } => {
+                    match process_images(&jobs) {
                         Ok((colors, monitor_results)) => {
                             let _ = resp_tx.send(WorkerResponse::Ready {
                                 colors,
-                                mode,
                                 monitors: monitor_results,
                             });
                         }
@@ -66,53 +70,68 @@ pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResp
 }
 
 fn process_images(
-    path: &std::path::Path,
-    mode: &str,
-    monitors: &[MonitorConfig],
+    jobs: &[MonitorJob],
 ) -> Result<(Vec<(u8, u8, u8)>, Vec<MonitorResult>), Box<dyn std::error::Error>> {
-    let image = image::open(path)
-    .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    if jobs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
 
-    // Extract colors once from a reasonably sized version for speed
-    let color_img = image.resize(800, 600, image::imageops::FilterType::Nearest);
+    // ── 1. Decode each unique image path only once ─────────────────
+    let mut decoded_images: HashMap<std::path::PathBuf, image::DynamicImage> = HashMap::new();
+
+    for job in jobs {
+        if !decoded_images.contains_key(&job.path) {
+            let img = image::open(&job.path)
+            .map_err(|e| format!("failed to open {}: {e}", job.path.display()))?;
+            decoded_images.insert(job.path.clone(), img);
+        }
+    }
+
+    // ── 2. Extract colors from the first job's image ───────────────
+    let first_path = &jobs[0].path;
+    let first_image = decoded_images.get(first_path).unwrap();
+    let color_img = first_image.resize(800, 600, image::imageops::FilterType::Nearest);
     let colors = extract_colors(&color_img.to_rgba8());
 
-    let resize = |img: &image::DynamicImage, w: u32, h: u32| -> image::RgbaImage {
-        match mode {
-            "fit" => {
-                let resized = img
-                .resize(w, h, image::imageops::FilterType::Lanczos3)
-                .to_rgba8();
-                let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
-                let x = (w.saturating_sub(resized.width())) / 2;
-                let y = (h.saturating_sub(resized.height())) / 2;
-                image::imageops::overlay(&mut bg, &resized, x as i64, y as i64);
-                bg
-            }
-            "stretch" => img
-            .resize_exact(w, h, image::imageops::FilterType::Lanczos3)
-            .to_rgba8(),
-            "center" => {
-                let resized = img.to_rgba8();
-                let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
-                let x = (w as i32 - resized.width() as i32) / 2;
-                let y = (h as i32 - resized.height() as i32) / 2;
-                image::imageops::overlay(&mut bg, &resized, x as i64, y as i64);
-                bg
-            }
-            _ => img
-            .resize_to_fill(w, h, image::imageops::FilterType::Lanczos3)
-            .to_rgba8(),
-        }
-    };
+    let mut results = Vec::with_capacity(jobs.len());
 
-    let mut results = Vec::with_capacity(monitors.len());
+    // ── 3. Process each monitor using the cached image ─────────────
+    for job in jobs {
+        let image = decoded_images.get(&job.path).unwrap();
 
-    for config in monitors {
-        let sharp_rgba = resize(&image, config.wp_width, config.wp_height);
+        let resize = |img: &image::DynamicImage, w: u32, h: u32| -> image::RgbaImage {
+            match job.mode.as_str() {
+                "fit" => {
+                    let resized = img
+                    .resize(w, h, image::imageops::FilterType::Lanczos3)
+                    .to_rgba8();
+                    let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
+                    let x = (w.saturating_sub(resized.width())) / 2;
+                    let y = (h.saturating_sub(resized.height())) / 2;
+                    image::imageops::overlay(&mut bg, &resized, x as i64, y as i64);
+                    bg
+                }
+                "stretch" => img
+                .resize_exact(w, h, image::imageops::FilterType::Lanczos3)
+                .to_rgba8(),
+                "center" => {
+                    let resized = img.to_rgba8();
+                    let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
+                    let x = (w as i32 - resized.width() as i32) / 2;
+                    let y = (h as i32 - resized.height() as i32) / 2;
+                    image::imageops::overlay(&mut bg, &resized, x as i64, y as i64);
+                    bg
+                }
+                _ => img
+                .resize_to_fill(w, h, image::imageops::FilterType::Lanczos3)
+                .to_rgba8(),
+            }
+        };
+
+        let sharp_rgba = resize(image, job.wp_width, job.wp_height);
         let wp_pixels = rgba_to_xrgb(&sharp_rgba);
 
-        let backdrop_rgba = resize(&image, config.bd_width, config.bd_height);
+        let backdrop_rgba = resize(image, job.bd_width, job.bd_height);
         let blurred_rgba = image::imageops::blur(&backdrop_rgba, 8.0);
         let bd_pixels = rgba_to_xrgb(&blurred_rgba);
 
@@ -125,9 +144,13 @@ fn process_images(
         bd_file.flush()?;
 
         results.push(MonitorResult {
-            wallpaper_file: wp_file,
-            backdrop_file: bd_file,
-            config: config.clone(),
+            name: job.name.clone(),
+                     wallpaper_file: wp_file,
+                     backdrop_file: bd_file,
+                     wp_width: job.wp_width,
+                     wp_height: job.wp_height,
+                     bd_width: job.bd_width,
+                     bd_height: job.bd_height,
         });
     }
 
