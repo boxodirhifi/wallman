@@ -134,6 +134,44 @@ fn prepare_surface(
     Ok(())
 }
 
+//--- color extraction------------------------
+
+fn write_colors_file(colors: &[(u8, u8, u8)]) {
+    if colors.is_empty() {
+        return;
+    }
+
+    let project_dirs = match directories::ProjectDirs::from("", "", "wallman") {
+        Some(dirs) => dirs,
+        None => {
+            eprintln!("Failed to determine cache directory for colors file");
+            return;
+        }
+    };
+
+    let cache_dir = project_dirs.cache_dir();
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        eprintln!("Failed to create cache directory: {e}");
+        return;
+    }
+
+    let colors_path = cache_dir.join("colors.toml");
+
+    let mut content = String::from("# Wallman color palette\n# Generated from current wallpaper\n\n");
+
+    let names = ["primary", "secondary", "tertiary", "quaternary", "quinary"];
+    for (i, color) in colors.iter().enumerate().take(5) {
+        let name = names.get(i).unwrap_or(&"extra");
+        content.push_str(&format!("{} = \"#{:02x}{:02x}{:02x}\"\n", name, color.0, color.1, color.2));
+    }
+
+    if let Err(e) = std::fs::write(&colors_path, content) {
+        eprintln!("Failed to write colors file: {e}");
+    } else {
+        println!("wrote color palette to {}", colors_path.display());
+    }
+}
+
 // ── Dispatch implementations ───────────────────────────────────────
 
 impl Dispatch<WlRegistry, ()> for State {
@@ -553,6 +591,7 @@ pub fn run(
             bd_width,
             bd_height,
             mode,
+            colors,
         } => {
             prepare_surface(
                 &mut state.wallpaper,
@@ -581,7 +620,7 @@ pub fn run(
                      image.as_ref().display(),
                      mode
             );
-
+            write_colors_file(&colors);
             state.current_mode = mode;
         }
         WorkerResponse::Failed(e) => {
@@ -647,6 +686,7 @@ pub fn run(
                     bd_width,
                     bd_height,
                     mode,
+                    colors,
                 } => {
                     let shm = match state.shm.as_ref() {
                         Some(s) => s.clone(),
@@ -678,7 +718,7 @@ pub fn run(
                         eprintln!("Failed to prepare backdrop surface: {e}");
                         continue;
                     }
-
+                    write_colors_file(&colors);
                     state.current_mode = mode;
                     println!("updated wallpaper (mode: {})", state.current_mode);
                 }

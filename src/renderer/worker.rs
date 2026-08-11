@@ -28,6 +28,7 @@ pub enum WorkerResponse {
         bd_width: u32,
         bd_height: u32,
         mode: String,
+        colors: Vec<(u8, u8, u8)>,
     },
     Failed(String),
 }
@@ -52,7 +53,7 @@ pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResp
                     match process_image_to_files(
                         &path, &mode, wp_width, wp_height, bd_width, bd_height,
                     ) {
-                        Ok((wp_file, bd_file)) => {
+                        Ok((wp_file, bd_file, colors)) => {
                             let _ = resp_tx.send(WorkerResponse::Ready {
                                 wallpaper_file: wp_file,
                                 backdrop_file: bd_file,
@@ -61,6 +62,7 @@ pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResp
                                 bd_width,
                                 bd_height,
                                 mode,
+                                colors,
                             });
                         }
                         Err(e) => {
@@ -84,16 +86,16 @@ fn process_image_to_files(
     wp_height: u32,
     bd_width: u32,
     bd_height: u32,
-) -> Result<(File, File), Box<dyn std::error::Error>> {
+) -> Result<(File, File, Vec<(u8, u8, u8)>), Box<dyn std::error::Error>> {
     let image = image::open(path)
-        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
 
     let resize = |img: &image::DynamicImage, w: u32, h: u32| -> image::RgbaImage {
         match mode {
             "fit" => {
                 let resized = img
-                    .resize(w, h, image::imageops::FilterType::Lanczos3)
-                    .to_rgba8();
+                .resize(w, h, image::imageops::FilterType::Lanczos3)
+                .to_rgba8();
                 let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
                 let x = (w.saturating_sub(resized.width())) / 2;
                 let y = (h.saturating_sub(resized.height())) / 2;
@@ -101,8 +103,8 @@ fn process_image_to_files(
                 bg
             }
             "stretch" => img
-                .resize_exact(w, h, image::imageops::FilterType::Lanczos3)
-                .to_rgba8(),
+            .resize_exact(w, h, image::imageops::FilterType::Lanczos3)
+            .to_rgba8(),
             "center" => {
                 let resized = img.to_rgba8();
                 let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
@@ -112,14 +114,17 @@ fn process_image_to_files(
                 bg
             }
             _ => img
-                .resize_to_fill(w, h, image::imageops::FilterType::Lanczos3)
-                .to_rgba8(),
+            .resize_to_fill(w, h, image::imageops::FilterType::Lanczos3)
+            .to_rgba8(),
         }
     };
 
     // ── Sharp wallpaper ────────────────────────────────────────────
     let sharp_rgba = resize(&image, wp_width, wp_height);
     let wallpaper_pixels = rgba_to_xrgb(&sharp_rgba);
+
+    // ── Extract colors from the sharp wallpaper ────────────────────
+    let colors = extract_colors(&sharp_rgba);
 
     // ── Blurred backdrop ───────────────────────────────────────────
     let backdrop_rgba = resize(&image, bd_width, bd_height);
@@ -135,7 +140,26 @@ fn process_image_to_files(
     bd_file.write_all(&backdrop_pixels)?;
     bd_file.flush()?;
 
-    Ok((wp_file, bd_file))
+    Ok((wp_file, bd_file, colors))
+}
+
+// ── Color extraction ───────────────────────────────────────────────
+
+fn extract_colors(rgba: &image::RgbaImage) -> Vec<(u8, u8, u8)> {
+    let pixels = rgba.as_raw();
+
+    match color_thief::get_palette(
+        pixels,
+        color_thief::ColorFormat::Rgba,
+        5,  // quality: 1=best/slowest, 10=fast
+        5,  // extract up to 5 colors
+    ) {
+        Ok(palette) => palette.iter().map(|c| (c.r, c.g, c.b)).collect(),
+        Err(e) => {
+            eprintln!("Color extraction failed: {e}");
+            Vec::new()
+        }
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
