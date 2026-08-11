@@ -31,6 +31,7 @@ pub enum RendererCommand {
     SetWallpaper {
         image: std::path::PathBuf,
         mode: String,
+        monitor: String, // empty string means all monitors
     },
     Reload,
 }
@@ -80,8 +81,10 @@ struct State {
     layer_shell: Option<ZwlrLayerShellV1>,
     monitors: Vec<Monitor>,
     pending_outputs: Vec<WlOutput>,
-    monitor_names: HashMap<ObjectId, String>, // Maps output ID to name
-    current_mode: String,
+    monitor_names: HashMap<ObjectId, String>,
+    current_mode: String, // Global default mode
+    default_image: Option<std::path::PathBuf>, // Global default image
+    monitor_overrides: HashMap<String, (std::path::PathBuf, String)>, // Per-monitor overrides
 }
 
 fn prepare_surface(
@@ -237,6 +240,29 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
     }
 }
 
+fn build_jobs(state: &State) -> Vec<MonitorJob> {
+    state.monitors.iter().filter_map(|m| {
+        // If this monitor has a specific override, use it. Otherwise, use the global default.
+        let (path, mode) = if let Some((p, m_mode)) = state.monitor_overrides.get(&m.name) {
+            (p.clone(), m_mode.clone())
+        } else if let Some(p) = &state.default_image {
+            (p.clone(), state.current_mode.clone())
+        } else {
+            return None;
+        };
+
+        Some(MonitorJob {
+            name: m.name.clone(),
+             path,
+             mode,
+             wp_width: m.wallpaper.width,
+             wp_height: m.wallpaper.height,
+             bd_width: m.backdrop.width,
+             bd_height: m.backdrop.height,
+        })
+    }).collect()
+}
+
 pub fn run(
     image: impl AsRef<std::path::Path>,
     initial_mode: String,
@@ -257,7 +283,9 @@ pub fn run(
         monitors: Vec::new(),
         pending_outputs: Vec::new(),
         monitor_names: HashMap::new(),
-        current_mode: initial_mode,
+        current_mode: initial_mode.clone(),
+        default_image: Some(image.as_ref().to_path_buf()),
+        monitor_overrides: HashMap::new(),
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -342,6 +370,9 @@ pub fn run(
 
     worker_tx.send(WorkerCommand::Process { jobs }).expect("worker crashed");
 
+    let jobs = build_jobs(&state);
+    worker_tx.send(WorkerCommand::Process { jobs }).expect("worker crashed");
+
     match worker_rx.recv().expect("worker crashed") {
         WorkerResponse::Ready { colors, monitors: results } => {
             write_colors_file(&colors);
@@ -364,29 +395,28 @@ pub fn run(
         while let Ok(command) = receiver.try_recv() {
             match command {
                 RendererCommand::Reload => {
-                    let jobs: Vec<MonitorJob> = state.monitors.iter().map(|m| MonitorJob {
-                        name: m.name.clone(),
-                                                                          path: image.as_ref().to_path_buf(),
-                                                                          mode: state.current_mode.clone(),
-                                                                          wp_width: m.wallpaper.width,
-                                                                          wp_height: m.wallpaper.height,
-                                                                          bd_width: m.backdrop.width,
-                                                                          bd_height: m.backdrop.height,
-                    }).collect();
-                    let _ = worker_tx.send(WorkerCommand::Process { jobs });
+                    let jobs = build_jobs(&state);
+                    if !jobs.is_empty() {
+                        let _ = worker_tx.send(WorkerCommand::Process { jobs });
+                    }
                 }
-                RendererCommand::SetWallpaper { image, mode } => {
-                    state.current_mode = mode.clone();
-                    let jobs: Vec<MonitorJob> = state.monitors.iter().map(|m| MonitorJob {
-                        name: m.name.clone(),
-                                                                          path: image.clone(),
-                                                                          mode: mode.clone(),
-                                                                          wp_width: m.wallpaper.width,
-                                                                          wp_height: m.wallpaper.height,
-                                                                          bd_width: m.backdrop.width,
-                                                                          bd_height: m.backdrop.height,
-                    }).collect();
-                    let _ = worker_tx.send(WorkerCommand::Process { jobs });
+                RendererCommand::SetWallpaper { image, mode, monitor } => {
+                    if monitor.is_empty() {
+                        // Global update: set default and clear any per-monitor overrides
+                        state.default_image = Some(image.clone());
+                        state.current_mode = mode.clone();
+                        state.monitor_overrides.clear();
+                        println!("Setting global wallpaper: {}", image.display());
+                    } else {
+                        // Per-monitor update
+                        state.monitor_overrides.insert(monitor.clone(), (image.clone(), mode.clone()));
+                        println!("Setting wallpaper for monitor {}: {}", monitor, image.display());
+                    }
+
+                    let jobs = build_jobs(&state);
+                    if !jobs.is_empty() {
+                        let _ = worker_tx.send(WorkerCommand::Process { jobs });
+                    }
                 }
             }
         }

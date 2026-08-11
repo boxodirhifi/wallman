@@ -27,6 +27,9 @@ pub enum Commands {
         ])
         )]
         mode: Option<String>,
+
+        #[arg(long)]
+        monitor: Option<String>,
     },
 
     #[command(about = "Run the wallpaper daemon")]

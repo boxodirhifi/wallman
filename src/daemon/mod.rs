@@ -54,11 +54,13 @@ impl Daemon {
                 Some("SET") => {
                     let image = parts.next().unwrap();
                     let mode = parts.next().unwrap_or(&default_mode);
+                    let monitor = parts.next().unwrap_or("");
 
                     renderer_sender
                     .send(crate::renderer::RendererCommand::SetWallpaper {
                         image: std::path::PathBuf::from(image),
                           mode: mode.to_string(),
+                          monitor: monitor.to_string(),
                     })
                     .expect("Failed to send wallpaper update to renderer");
                 }

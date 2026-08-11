@@ -4,6 +4,7 @@ use std::{fs, path::PathBuf};
 pub fn run(
     image: PathBuf,
     mode: Option<String>,
+    monitor: Option<String>,
 ) {
     let config = crate::config::load();
 
@@ -23,8 +24,14 @@ pub fn run(
     fs::create_dir_all(cache_dir)
     .expect("Failed to create cache directory");
 
-    let cached_wallpaper = cache_dir.join("current.png");
-    let temporary_wallpaper = cache_dir.join("current.png.tmp");
+    let cache_filename = if let Some(ref m) = monitor {
+        format!("{}.png", m)
+    } else {
+        "current.png".to_string()
+    };
+
+    let cached_wallpaper = cache_dir.join(&cache_filename);
+    let temporary_wallpaper = cache_dir.join(format!("{}.tmp", cache_filename));
 
     // Decode the source image and save it as PNG to a temporary file.
     let decoded = image::open(&image)
@@ -56,16 +63,20 @@ pub fn run(
         std::process::exit(1);
     });
 
+    let display_monitor = monitor.as_deref().unwrap_or("all monitors");
     println!(
-        "Cached wallpaper: {} → {}",
-        image.display(),
-             cached_wallpaper.display()
+        "Cached wallpaper: {} → {} (Target: {})",
+             image.display(),
+             cached_wallpaper.display(),
+             display_monitor
     );
 
+    let ipc_monitor = monitor.unwrap_or_default();
     let command = format!(
-        "SET|{}|{}",
+        "SET|{}|{}|{}",
         cached_wallpaper.display(),
                           mode,
+                          ipc_monitor
     );
 
     crate::ipc::send_command(&command);
