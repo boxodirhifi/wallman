@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::collections::HashMap;
-use rayon::prelude::*;
 
 #[derive(Clone)]
 pub struct MonitorJob {
@@ -154,7 +153,11 @@ fn process_images(
                      bd_height: job.bd_height,
         });
     }
-
+    // Force glibc to return freed memory to the OS
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
     Ok((colors, results))
 }
 
@@ -176,19 +179,15 @@ fn extract_colors(rgba: &image::RgbaImage) -> Vec<(u8, u8, u8)> {
 }
 
 fn rgba_to_xrgb(rgba: &image::RgbaImage) -> Vec<u8> {
-    // par_chunks_exact splits the pixel data into parallel jobs automatically.
-    // flat_map converts each 4-byte RGBA chunk into a 4-byte XRGB chunk in parallel.
-    rgba.as_raw()
-    .par_chunks_exact(4)
-    .flat_map(|chunk| {
+    let mut pixels = Vec::with_capacity(rgba.len());
+    for chunk in rgba.chunks_exact(4) {
         let r = chunk[0] as u32;
         let g = chunk[1] as u32;
         let b = chunk[2] as u32;
-
         let pixel = (r << 16) | (g << 8) | b;
-        pixel.to_ne_bytes()
-    })
-    .collect()
+        pixels.extend_from_slice(&pixel.to_ne_bytes());
+    }
+    pixels
 }
 
 fn create_shm_file(name: &str, size: usize) -> Result<File, Box<dyn std::error::Error>> {
