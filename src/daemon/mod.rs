@@ -52,7 +52,10 @@ impl Daemon {
 
             match action {
                 Some("SET") => {
-                    let image = parts.next().unwrap();
+                    let Some(image) = parts.next() else {
+                        eprintln!("Malformed IPC command: SET missing image path");
+                        return; // Safely ignores the bad command instead of crashing
+                    };
                     let mode = parts.next().unwrap_or(&default_mode);
                     let monitor = parts.next().unwrap_or("");
 
