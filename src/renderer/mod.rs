@@ -1,7 +1,7 @@
-use std::ffi::CString;
+mod worker;
+
 use std::fs::File;
-use std::io::Write;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::fd::AsFd;
 use std::sync::mpsc::Receiver;
 
 use wayland_client::{
@@ -15,13 +15,15 @@ use wayland_client::{
         wl_shm_pool::{self, WlShmPool},
         wl_surface::{self, WlSurface},
     },
-    Connection, Dispatch, EventQueue, QueueHandle,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
 
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
+
+use worker::{spawn_worker, WorkerCommand, WorkerResponse};
 
 pub enum RendererCommand {
     SetWallpaper {
@@ -40,6 +42,7 @@ struct SurfaceState {
     pool: Option<WlShmPool>,
     buffer: Option<WlBuffer>,
     file: Option<File>,
+    old_buffers: Vec<WlBuffer>,
     configure_serial: Option<u32>,
     width: u32,
     height: u32,
@@ -55,6 +58,7 @@ impl SurfaceState {
             pool: None,
             buffer: None,
             file: None,
+            old_buffers: Vec::new(),
             configure_serial: None,
             width: 0,
             height: 0,
@@ -74,108 +78,13 @@ struct State {
     current_mode: String,
 }
 
-// ── Image processing pipeline ──────────────────────────────────────
-
-struct ProcessedImages {
-    wallpaper_pixels: Vec<u8>,
-    backdrop_pixels: Vec<u8>,
-}
-
-fn rgba_to_xrgb(rgba: &image::RgbaImage) -> Vec<u8> {
-    let mut pixels = Vec::with_capacity(rgba.len());
-
-    for chunk in rgba.chunks_exact(4) {
-        let r = chunk[0] as u32;
-        let g = chunk[1] as u32;
-        let b = chunk[2] as u32;
-
-        let pixel = (r << 16) | (g << 8) | b;
-        pixels.extend_from_slice(&pixel.to_ne_bytes());
-    }
-
-    pixels
-}
-
-fn process_image(
-    path: impl AsRef<std::path::Path>,
-    mode: &str,
-    wp_width: u32,
-    wp_height: u32,
-    bd_width: u32,
-    bd_height: u32,
-) -> Result<ProcessedImages, Box<dyn std::error::Error>> {
-    let path = path.as_ref();
-
-    let image = image::open(path)
-    .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-
-    let resize = |img: &image::DynamicImage, w: u32, h: u32| -> image::RgbaImage {
-        match mode {
-            "fit" => {
-                let resized = img.resize(w, h, image::imageops::FilterType::Lanczos3).to_rgba8();
-                let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
-                let x = (w.saturating_sub(resized.width())) / 2;
-                let y = (h.saturating_sub(resized.height())) / 2;
-                image::imageops::overlay(&mut bg, &resized, x as i64, y as i64);
-                bg
-            }
-            "stretch" => {
-                img.resize_exact(w, h, image::imageops::FilterType::Lanczos3).to_rgba8()
-            }
-            "center" => {
-                let resized = img.to_rgba8();
-                let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
-                let x = (w as i32 - resized.width() as i32) / 2;
-                let y = (h as i32 - resized.height() as i32) / 2;
-                image::imageops::overlay(&mut bg, &resized, x as i64, y as i64);
-                bg
-            }
-            _ => { // "fill" or unknown
-                img.resize_to_fill(w, h, image::imageops::FilterType::Lanczos3).to_rgba8()
-            }
-        }
-    };
-
-    // ── Sharp wallpaper ────────────────────────────────────────────
-    let sharp_rgba = resize(&image, wp_width, wp_height);
-    let wallpaper_pixels = rgba_to_xrgb(&sharp_rgba);
-
-    // ── Blurred backdrop ───────────────────────────────────────────
-    let backdrop_rgba = resize(&image, bd_width, bd_height);
-    let blurred_rgba = image::imageops::blur(&backdrop_rgba, 8.0);
-    let backdrop_pixels = rgba_to_xrgb(&blurred_rgba);
-
-    Ok(ProcessedImages {
-        wallpaper_pixels,
-       backdrop_pixels,
-    })
-}
-
-// ── Wayland helpers ────────────────────────────────────────────────
-
-fn create_shm_file(
-    name: &str,
-    size: usize,
-) -> Result<File, Box<dyn std::error::Error>> {
-    let cname = CString::new(name)?;
-
-    let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
-
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-
-    let file = unsafe { File::from_raw_fd(fd) };
-    file.set_len(u64::try_from(size)?)?;
-
-    Ok(file)
-}
+// ── Wayland surface preparation ────────────────────────────────────
 
 fn prepare_surface(
     ss: &mut SurfaceState,
     shm: &WlShm,
     qh: &QueueHandle<State>,
-    pixels: &[u8],
+    file: File,
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -191,15 +100,6 @@ fn prepare_surface(
     .ok_or("buffer size overflow")?;
 
     let stride_i32 = i32::try_from(stride)?;
-
-    if pixels.len() != expected_size {
-        return Err("pixel data does not match the expected buffer size".into());
-    }
-
-    let mut file = create_shm_file(&ss.namespace, expected_size)?;
-    file.write_all(pixels)?;
-    file.flush()?;
-
     let size_i32 = i32::try_from(expected_size)?;
 
     let pool: WlShmPool = shm.create_pool(file.as_fd(), size_i32, qh, ());
@@ -220,6 +120,11 @@ fn prepare_surface(
         surface.commit();
     } else {
         return Err("wl_surface not created".into());
+    }
+
+    // Move old buffer to graveyard before overwriting
+    if let Some(old_buffer) = ss.buffer.take() {
+        ss.old_buffers.push(old_buffer);
     }
 
     ss.pool = Some(pool);
@@ -316,18 +221,16 @@ impl Dispatch<WlShmPool, ()> for State {
 
 impl Dispatch<WlBuffer, ()> for State {
     fn event(
-        _state: &mut State,
-        _buffer: &WlBuffer,
+        state: &mut State,
+        buffer: &WlBuffer,
         event: wl_buffer::Event,
         _data: &(),
              _conn: &Connection,
              _qh: &QueueHandle<State>,
     ) {
         if let wl_buffer::Event::Release = event {
-            // Wayland has released the buffer.
-            // Since we overwrite ss.buffer in prepare_surface, the old
-            // WlBuffer proxy was already dropped (sending destroy).
-            // We don't need to track this state anymore.
+            state.wallpaper.old_buffers.retain(|b| b.id() != buffer.id());
+            state.backdrop.old_buffers.retain(|b| b.id() != buffer.id());
         }
     }
 }
@@ -616,49 +519,75 @@ pub fn run(
         println!("[wallman-backdrop] acknowledged configure serial={bd_serial}");
     }
 
-    // ── Process initial image (strict: crash if cached image is bad) ──
+    // ── Spawn worker thread ────────────────────────────────────────
+    let (worker_tx, worker_rx) = spawn_worker();
+
+    // ── Initial image processing (blocking is OK for first load) ───
     let shm = state
     .shm
     .as_ref()
     .ok_or("wl_shm not bound")?
     .clone();
 
-    let images = process_image(
-        image.as_ref(),
-                               &state.current_mode,
-                               wp_width,
-                               wp_height,
-                               bd_width,
-                               bd_height,
-    )?;
+    worker_tx
+    .send(WorkerCommand::Process {
+        path: image.as_ref().to_path_buf(),
+          mode: state.current_mode.clone(),
+          wp_width,
+          wp_height,
+          bd_width,
+          bd_height,
+    })
+    .expect("Failed to send initial process command to worker");
 
-    prepare_surface(
-        &mut state.wallpaper,
-        &shm,
-        &qh,
-        &images.wallpaper_pixels,
-        wp_width,
-        wp_height,
-    )?;
-    println!(
-        "[wallpaper] drew sharp image from {} (mode: {})",
-             image.as_ref().display(),
-             state.current_mode
-    );
+    let response = worker_rx
+    .recv()
+    .expect("Worker thread crashed during initial load");
 
-    prepare_surface(
-        &mut state.backdrop,
-        &shm,
-        &qh,
-        &images.backdrop_pixels,
-        bd_width,
-        bd_height,
-    )?;
-    println!(
-        "[wallman-backdrop] drew blurred image from {} (mode: {})",
-             image.as_ref().display(),
-             state.current_mode
-    );
+    match response {
+        WorkerResponse::Ready {
+            wallpaper_file,
+            backdrop_file,
+            wp_width,
+            wp_height,
+            bd_width,
+            bd_height,
+            mode,
+        } => {
+            prepare_surface(
+                &mut state.wallpaper,
+                &shm,
+                &qh,
+                wallpaper_file,
+                wp_width,
+                wp_height,
+            )?;
+            println!(
+                "[wallpaper] drew sharp image from {} (mode: {})",
+                     image.as_ref().display(),
+                     mode
+            );
+
+            prepare_surface(
+                &mut state.backdrop,
+                &shm,
+                &qh,
+                backdrop_file,
+                bd_width,
+                bd_height,
+            )?;
+            println!(
+                "[wallman-backdrop] drew blurred image from {} (mode: {})",
+                     image.as_ref().display(),
+                     mode
+            );
+
+            state.current_mode = mode;
+        }
+        WorkerResponse::Failed(e) => {
+            return Err(format!("Failed to process initial image: {e}").into());
+        }
+    }
 
     event_queue.roundtrip(&mut state)?;
 
@@ -670,113 +599,91 @@ pub fn run(
             break;
         }
 
+        // ── Handle IPC commands ────────────────────────────────────
         while let Ok(command) = receiver.try_recv() {
             match command {
                 RendererCommand::Reload => {
-                    let shm = match state.shm.as_ref() {
-                        Some(s) => s.clone(),
-                        None => {
-                            eprintln!("Failed to reload: wl_shm not bound");
-                            continue;
-                        }
-                    };
-
                     let wp_w = state.wallpaper.width;
                     let wp_h = state.wallpaper.height;
                     let bd_w = state.backdrop.width;
                     let bd_h = state.backdrop.height;
+                    let mode = state.current_mode.clone();
 
-                    match process_image(&image, &state.current_mode, wp_w, wp_h, bd_w, bd_h) {
-                        Ok(images) => {
-                            if let Err(e) = prepare_surface(
-                                &mut state.wallpaper,
-                                &shm,
-                                &qh,
-                                &images.wallpaper_pixels,
-                                wp_w,
-                                wp_h,
-                            ) {
-                                eprintln!("Failed to prepare wallpaper surface: {e}");
-                                continue;
-                            }
-                            if let Err(e) = prepare_surface(
-                                &mut state.backdrop,
-                                &shm,
-                                &qh,
-                                &images.backdrop_pixels,
-                                bd_w,
-                                bd_h,
-                            ) {
-                                eprintln!("Failed to prepare backdrop surface: {e}");
-                                continue;
-                            }
-
-                            println!(
-                                "reloaded wallpaper from {} (mode: {})",
-                                     image.as_ref().display(),
-                                     state.current_mode
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Failed to reload image {}: {e}",
-                                image.as_ref().display()
-                            );
-                        }
-                    }
+                    let _ = worker_tx.send(WorkerCommand::Process {
+                        path: image.as_ref().to_path_buf(),
+                                           mode,
+                                           wp_width: wp_w,
+                                           wp_height: wp_h,
+                                           bd_width: bd_w,
+                                           bd_height: bd_h,
+                    });
                 }
                 RendererCommand::SetWallpaper { image, mode } => {
-                    let shm = match state.shm.as_ref() {
-                        Some(s) => s.clone(),
-                        None => {
-                            eprintln!("Failed to set wallpaper: wl_shm not bound");
-                            continue;
-                        }
-                    };
-
                     let wp_w = state.wallpaper.width;
                     let wp_h = state.wallpaper.height;
                     let bd_w = state.backdrop.width;
                     let bd_h = state.backdrop.height;
 
-                    match process_image(&image, &mode, wp_w, wp_h, bd_w, bd_h) {
-                        Ok(images) => {
-                            if let Err(e) = prepare_surface(
-                                &mut state.wallpaper,
-                                &shm,
-                                &qh,
-                                &images.wallpaper_pixels,
-                                wp_w,
-                                wp_h,
-                            ) {
-                                eprintln!("Failed to prepare wallpaper surface: {e}");
-                                continue;
-                            }
-                            if let Err(e) = prepare_surface(
-                                &mut state.backdrop,
-                                &shm,
-                                &qh,
-                                &images.backdrop_pixels,
-                                bd_w,
-                                bd_h,
-                            ) {
-                                eprintln!("Failed to prepare backdrop surface: {e}");
-                                continue;
-                            }
+                    let _ = worker_tx.send(WorkerCommand::Process {
+                        path: image,
+                        mode,
+                        wp_width: wp_w,
+                        wp_height: wp_h,
+                        bd_width: bd_w,
+                        bd_height: bd_h,
+                    });
+                }
+            }
+        }
 
-                            // Only update mode after successful draw
-                            state.current_mode = mode;
+        // ── Handle worker responses ────────────────────────────────
+        while let Ok(response) = worker_rx.try_recv() {
+            match response {
+                WorkerResponse::Ready {
+                    wallpaper_file,
+                    backdrop_file,
+                    wp_width,
+                    wp_height,
+                    bd_width,
+                    bd_height,
+                    mode,
+                } => {
+                    let shm = match state.shm.as_ref() {
+                        Some(s) => s.clone(),
+                        None => {
+                            eprintln!("Failed to apply wallpaper: wl_shm not bound");
+                            continue;
+                        }
+                    };
 
-                            println!(
-                                "updated wallpaper from {} (mode: {})",
-                                     image.display(),
-                                     state.current_mode
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to process image {}: {e}", image.display());
-                        }
+                    if let Err(e) = prepare_surface(
+                        &mut state.wallpaper,
+                        &shm,
+                        &qh,
+                        wallpaper_file,
+                        wp_width,
+                        wp_height,
+                    ) {
+                        eprintln!("Failed to prepare wallpaper surface: {e}");
+                        continue;
                     }
+                    if let Err(e) = prepare_surface(
+                        &mut state.backdrop,
+                        &shm,
+                        &qh,
+                        backdrop_file,
+                        bd_width,
+                        bd_height,
+                    ) {
+                        eprintln!("Failed to prepare backdrop surface: {e}");
+                        continue;
+                    }
+
+                    state.current_mode = mode;
+                    println!("updated wallpaper (mode: {})", state.current_mode);
+                }
+                WorkerResponse::Failed(e) => {
+                    eprintln!("Failed to process image: {e}");
                 }
             }
         }
@@ -804,7 +711,7 @@ pub fn run(
 
         let fd = read_guard.connection_fd();
         let mut fds = [libc::pollfd {
-            fd: fd.as_raw_fd(),
+            fd: std::os::fd::AsRawFd::as_raw_fd(&fd),
             events: libc::POLLIN,
             revents: 0,
         }];
