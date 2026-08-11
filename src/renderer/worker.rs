@@ -6,34 +6,36 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-// ── Worker messages ────────────────────────────────────────────────
+#[derive(Clone)]
+pub struct MonitorConfig {
+    pub wp_width: u32,
+    pub wp_height: u32,
+    pub bd_width: u32,
+    pub bd_height: u32,
+}
+
+pub struct MonitorResult {
+    pub wallpaper_file: File,
+    pub backdrop_file: File,
+    pub config: MonitorConfig,
+}
 
 pub enum WorkerCommand {
     Process {
         path: PathBuf,
         mode: String,
-        wp_width: u32,
-        wp_height: u32,
-        bd_width: u32,
-        bd_height: u32,
+        monitors: Vec<MonitorConfig>,
     },
 }
 
 pub enum WorkerResponse {
     Ready {
-        wallpaper_file: File,
-        backdrop_file: File,
-        wp_width: u32,
-        wp_height: u32,
-        bd_width: u32,
-        bd_height: u32,
-        mode: String,
         colors: Vec<(u8, u8, u8)>,
+        mode: String,
+        monitors: Vec<MonitorResult>,
     },
     Failed(String),
 }
-
-// ── Worker thread entry point ──────────────────────────────────────
 
 pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResponse>) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -42,27 +44,13 @@ pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResp
     thread::spawn(move || {
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
-                WorkerCommand::Process {
-                    path,
-                    mode,
-                    wp_width,
-                    wp_height,
-                    bd_width,
-                    bd_height,
-                } => {
-                    match process_image_to_files(
-                        &path, &mode, wp_width, wp_height, bd_width, bd_height,
-                    ) {
-                        Ok((wp_file, bd_file, colors)) => {
+                WorkerCommand::Process { path, mode, monitors } => {
+                    match process_images(&path, &mode, &monitors) {
+                        Ok((colors, monitor_results)) => {
                             let _ = resp_tx.send(WorkerResponse::Ready {
-                                wallpaper_file: wp_file,
-                                backdrop_file: bd_file,
-                                wp_width,
-                                wp_height,
-                                bd_width,
-                                bd_height,
-                                mode,
                                 colors,
+                                mode,
+                                monitors: monitor_results,
                             });
                         }
                         Err(e) => {
@@ -77,18 +65,17 @@ pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResp
     (cmd_tx, resp_rx)
 }
 
-// ── Image processing pipeline (runs on worker thread) ─────────────
-
-fn process_image_to_files(
+fn process_images(
     path: &std::path::Path,
     mode: &str,
-    wp_width: u32,
-    wp_height: u32,
-    bd_width: u32,
-    bd_height: u32,
-) -> Result<(File, File, Vec<(u8, u8, u8)>), Box<dyn std::error::Error>> {
+    monitors: &[MonitorConfig],
+) -> Result<(Vec<(u8, u8, u8)>, Vec<MonitorResult>), Box<dyn std::error::Error>> {
     let image = image::open(path)
     .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+
+    // Extract colors once from a reasonably sized version for speed
+    let color_img = image.resize(800, 600, image::imageops::FilterType::Nearest);
+    let colors = extract_colors(&color_img.to_rgba8());
 
     let resize = |img: &image::DynamicImage, w: u32, h: u32| -> image::RgbaImage {
         match mode {
@@ -119,31 +106,33 @@ fn process_image_to_files(
         }
     };
 
-    // ── Sharp wallpaper ────────────────────────────────────────────
-    let sharp_rgba = resize(&image, wp_width, wp_height);
-    let wallpaper_pixels = rgba_to_xrgb(&sharp_rgba);
+    let mut results = Vec::with_capacity(monitors.len());
 
-    // ── Extract colors from the sharp wallpaper ────────────────────
-    let colors = extract_colors(&sharp_rgba);
+    for config in monitors {
+        let sharp_rgba = resize(&image, config.wp_width, config.wp_height);
+        let wp_pixels = rgba_to_xrgb(&sharp_rgba);
 
-    // ── Blurred backdrop ───────────────────────────────────────────
-    let backdrop_rgba = resize(&image, bd_width, bd_height);
-    let blurred_rgba = image::imageops::blur(&backdrop_rgba, 8.0);
-    let backdrop_pixels = rgba_to_xrgb(&blurred_rgba);
+        let backdrop_rgba = resize(&image, config.bd_width, config.bd_height);
+        let blurred_rgba = image::imageops::blur(&backdrop_rgba, 8.0);
+        let bd_pixels = rgba_to_xrgb(&blurred_rgba);
 
-    // ── Write to shared memory files ───────────────────────────────
-    let mut wp_file = create_shm_file("wallman-wallpaper", wallpaper_pixels.len())?;
-    wp_file.write_all(&wallpaper_pixels)?;
-    wp_file.flush()?;
+        let mut wp_file = create_shm_file("wallman-wallpaper", wp_pixels.len())?;
+        wp_file.write_all(&wp_pixels)?;
+        wp_file.flush()?;
 
-    let mut bd_file = create_shm_file("wallman-backdrop", backdrop_pixels.len())?;
-    bd_file.write_all(&backdrop_pixels)?;
-    bd_file.flush()?;
+        let mut bd_file = create_shm_file("wallman-backdrop", bd_pixels.len())?;
+        bd_file.write_all(&bd_pixels)?;
+        bd_file.flush()?;
 
-    Ok((wp_file, bd_file, colors))
+        results.push(MonitorResult {
+            wallpaper_file: wp_file,
+            backdrop_file: bd_file,
+            config: config.clone(),
+        });
+    }
+
+    Ok((colors, results))
 }
-
-// ── Color extraction ───────────────────────────────────────────────
 
 fn extract_colors(rgba: &image::RgbaImage) -> Vec<(u8, u8, u8)> {
     let pixels = rgba.as_raw();
@@ -151,8 +140,8 @@ fn extract_colors(rgba: &image::RgbaImage) -> Vec<(u8, u8, u8)> {
     match color_thief::get_palette(
         pixels,
         color_thief::ColorFormat::Rgba,
-        5,  // quality: 1=best/slowest, 10=fast
-        5,  // extract up to 5 colors
+        5,
+        5,
     ) {
         Ok(palette) => palette.iter().map(|c| (c.r, c.g, c.b)).collect(),
         Err(e) => {
@@ -162,34 +151,25 @@ fn extract_colors(rgba: &image::RgbaImage) -> Vec<(u8, u8, u8)> {
     }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────
-
 fn rgba_to_xrgb(rgba: &image::RgbaImage) -> Vec<u8> {
     let mut pixels = Vec::with_capacity(rgba.len());
-
     for chunk in rgba.chunks_exact(4) {
         let r = chunk[0] as u32;
         let g = chunk[1] as u32;
         let b = chunk[2] as u32;
-
         let pixel = (r << 16) | (g << 8) | b;
         pixels.extend_from_slice(&pixel.to_ne_bytes());
     }
-
     pixels
 }
 
 fn create_shm_file(name: &str, size: usize) -> Result<File, Box<dyn std::error::Error>> {
     let cname = CString::new(name)?;
-
     let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
-
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-
     let file = unsafe { File::from_raw_fd(fd) };
     file.set_len(u64::try_from(size)?)?;
-
     Ok(file)
 }

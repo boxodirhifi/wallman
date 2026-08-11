@@ -1,10 +1,12 @@
 mod worker;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::sync::mpsc::Receiver;
 
 use wayland_client::{
+    backend::ObjectId,
     protocol::{
         wl_buffer::{self, WlBuffer},
         wl_callback::{self, WlCallback},
@@ -23,7 +25,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
-use worker::{spawn_worker, WorkerCommand, WorkerResponse};
+use worker::{spawn_worker, WorkerCommand, WorkerResponse, MonitorJob};
 
 pub enum RendererCommand {
     SetWallpaper {
@@ -32,8 +34,6 @@ pub enum RendererCommand {
     },
     Reload,
 }
-
-// ── Per-surface state ──────────────────────────────────────────────
 
 struct SurfaceState {
     namespace: String,
@@ -67,18 +67,22 @@ impl SurfaceState {
     }
 }
 
-// ── Global state ───────────────────────────────────────────────────
+struct Monitor {
+    name: String,
+    _output: WlOutput,
+    wallpaper: SurfaceState,
+    backdrop: SurfaceState,
+}
 
 struct State {
     compositor: Option<WlCompositor>,
     shm: Option<WlShm>,
     layer_shell: Option<ZwlrLayerShellV1>,
-    wallpaper: SurfaceState,
-    backdrop: SurfaceState,
+    monitors: Vec<Monitor>,
+    pending_outputs: Vec<WlOutput>,
+    monitor_names: HashMap<ObjectId, String>, // Maps output ID to name
     current_mode: String,
 }
-
-// ── Wayland surface preparation ────────────────────────────────────
 
 fn prepare_surface(
     ss: &mut SurfaceState,
@@ -90,29 +94,13 @@ fn prepare_surface(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let width_i32 = i32::try_from(width)?;
     let height_i32 = i32::try_from(height)?;
-
-    let stride = usize::try_from(width)?
-    .checked_mul(4)
-    .ok_or("stride overflow")?;
-
-    let expected_size = stride
-    .checked_mul(usize::try_from(height)?)
-    .ok_or("buffer size overflow")?;
-
+    let stride = usize::try_from(width)?.checked_mul(4).ok_or("stride overflow")?;
+    let expected_size = stride.checked_mul(usize::try_from(height)?).ok_or("buffer size overflow")?;
     let stride_i32 = i32::try_from(stride)?;
     let size_i32 = i32::try_from(expected_size)?;
 
     let pool: WlShmPool = shm.create_pool(file.as_fd(), size_i32, qh, ());
-
-    let buffer: WlBuffer = pool.create_buffer(
-        0,
-        width_i32,
-        height_i32,
-        stride_i32,
-        wl_shm::Format::Xrgb8888,
-        qh,
-        (),
-    );
+    let buffer: WlBuffer = pool.create_buffer(0, width_i32, height_i32, stride_i32, wl_shm::Format::Xrgb8888, qh, ());
 
     if let Some(surface) = ss.surface.as_ref() {
         surface.attach(Some(&buffer), 0, 0);
@@ -122,7 +110,6 @@ fn prepare_surface(
         return Err("wl_surface not created".into());
     }
 
-    // Move old buffer to graveyard before overwriting
     if let Some(old_buffer) = ss.buffer.take() {
         ss.old_buffers.push(old_buffer);
     }
@@ -130,41 +117,26 @@ fn prepare_surface(
     ss.pool = Some(pool);
     ss.buffer = Some(buffer);
     ss.file = Some(file);
-
     Ok(())
 }
 
-//--- color extraction------------------------
-
 fn write_colors_file(colors: &[(u8, u8, u8)]) {
-    if colors.is_empty() {
-        return;
-    }
-
+    if colors.is_empty() { return; }
     let project_dirs = match directories::ProjectDirs::from("", "", "wallman") {
         Some(dirs) => dirs,
-        None => {
-            eprintln!("Failed to determine cache directory for colors file");
-            return;
-        }
+        None => { eprintln!("Failed to determine cache directory for colors file"); return; }
     };
-
     let cache_dir = project_dirs.cache_dir();
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
-        eprintln!("Failed to create cache directory: {e}");
-        return;
+        eprintln!("Failed to create cache directory: {e}"); return;
     }
-
     let colors_path = cache_dir.join("colors.toml");
-
     let mut content = String::from("# Wallman color palette\n# Generated from current wallpaper\n\n");
-
     let names = ["primary", "secondary", "tertiary", "quaternary", "quinary"];
     for (i, color) in colors.iter().enumerate().take(5) {
         let name = names.get(i).unwrap_or(&"extra");
         content.push_str(&format!("{} = \"#{:02x}{:02x}{:02x}\"\n", name, color.0, color.1, color.2));
     }
-
     if let Err(e) = std::fs::write(&colors_path, content) {
         eprintln!("Failed to write colors file: {e}");
     } else {
@@ -172,45 +144,33 @@ fn write_colors_file(colors: &[(u8, u8, u8)]) {
     }
 }
 
-// ── Dispatch implementations ───────────────────────────────────────
-
 impl Dispatch<WlRegistry, ()> for State {
-    fn event(
-        state: &mut State,
-        registry: &WlRegistry,
-        event: wl_registry::Event,
-        _data: &(),
-             _conn: &Connection,
-             qh: &QueueHandle<State>,
-    ) {
+    fn event(state: &mut State, registry: &WlRegistry, event: wl_registry::Event, _data: &(), _conn: &Connection, qh: &QueueHandle<State>) {
         match event {
-            wl_registry::Event::Global {
-                name,
-                interface,
-                version,
-            } => {
+            wl_registry::Event::Global { name, interface, version } => {
                 if interface == "wl_compositor" && state.compositor.is_none() {
                     let bind_version = version.min(6);
-                    let compositor: WlCompositor =
-                    registry.bind(name, bind_version, qh, ());
+                    let compositor: WlCompositor = registry.bind(name, bind_version, qh, ());
                     state.compositor = Some(compositor);
                     println!("bound: wl_compositor v{bind_version}");
                 }
-
                 if interface == "wl_shm" && state.shm.is_none() {
                     let bind_version = version.min(2);
-                    let shm: WlShm =
-                    registry.bind(name, bind_version, qh, ());
+                    let shm: WlShm = registry.bind(name, bind_version, qh, ());
                     state.shm = Some(shm);
                     println!("bound: wl_shm v{bind_version}");
                 }
-
                 if interface == "zwlr_layer_shell_v1" && state.layer_shell.is_none() {
                     let bind_version = version.min(5);
-                    let layer_shell: ZwlrLayerShellV1 =
-                    registry.bind(name, bind_version, qh, ());
+                    let layer_shell: ZwlrLayerShellV1 = registry.bind(name, bind_version, qh, ());
                     state.layer_shell = Some(layer_shell);
                     println!("bound: zwlr_layer_shell_v1 v{bind_version}");
+                }
+                if interface == "wl_output" {
+                    let bind_version = version.min(4);
+                    let output: WlOutput = registry.bind(name, bind_version, qh, ());
+                    state.pending_outputs.push(output);
+                    println!("bound: wl_output v{bind_version}");
                 }
             }
             wl_registry::Event::GlobalRemove { name } => {
@@ -221,152 +181,61 @@ impl Dispatch<WlRegistry, ()> for State {
     }
 }
 
-impl Dispatch<WlCompositor, ()> for State {
-    fn event(
-        _state: &mut State,
-        _compositor: &WlCompositor,
-        _event: wl_compositor::Event,
-        _data: &(),
-             _conn: &Connection,
-             _qh: &QueueHandle<State>,
-    ) {
-    }
-}
+impl Dispatch<WlCompositor, ()> for State { fn event(_s: &mut Self, _o: &WlCompositor, _e: wl_compositor::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {} }
+impl Dispatch<WlShm, ()> for State { fn event(_s: &mut Self, _o: &WlShm, _e: wl_shm::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {} }
+impl Dispatch<WlShmPool, ()> for State { fn event(_s: &mut Self, _o: &WlShmPool, _e: wl_shm_pool::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {} }
+impl Dispatch<WlSurface, ()> for State { fn event(_s: &mut Self, _o: &WlSurface, _e: wl_surface::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {} }
+impl Dispatch<ZwlrLayerShellV1, ()> for State { fn event(_s: &mut Self, _o: &ZwlrLayerShellV1, _e: zwlr_layer_shell_v1::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {} }
+impl Dispatch<WlCallback, ()> for State { fn event(_s: &mut Self, _o: &WlCallback, _e: wl_callback::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {} }
 
-impl Dispatch<WlShm, ()> for State {
-    fn event(
-        _state: &mut State,
-        _shm: &WlShm,
-        _event: wl_shm::Event,
-        _data: &(),
-             _conn: &Connection,
-             _qh: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<WlShmPool, ()> for State {
-    fn event(
-        _state: &mut State,
-        _pool: &WlShmPool,
-        _event: wl_shm_pool::Event,
-        _data: &(),
-             _conn: &Connection,
-             _qh: &QueueHandle<State>,
-    ) {
+impl Dispatch<WlOutput, ()> for State {
+    fn event(state: &mut State, output: &WlOutput, event: wl_output::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {
+        if let wl_output::Event::Name { name } = event {
+            // Store the name using the output's unique ID
+            state.monitor_names.insert(output.id(), name.clone());
+            println!("Discovered monitor: {}", name);
+        }
     }
 }
 
 impl Dispatch<WlBuffer, ()> for State {
-    fn event(
-        state: &mut State,
-        buffer: &WlBuffer,
-        event: wl_buffer::Event,
-        _data: &(),
-             _conn: &Connection,
-             _qh: &QueueHandle<State>,
-    ) {
+    fn event(state: &mut State, buffer: &WlBuffer, event: wl_buffer::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {
         if let wl_buffer::Event::Release = event {
-            state.wallpaper.old_buffers.retain(|b| b.id() != buffer.id());
-            state.backdrop.old_buffers.retain(|b| b.id() != buffer.id());
+            for monitor in &mut state.monitors {
+                monitor.wallpaper.old_buffers.retain(|b| b.id() != buffer.id());
+                monitor.backdrop.old_buffers.retain(|b| b.id() != buffer.id());
+            }
         }
-    }
-}
-
-impl Dispatch<WlSurface, ()> for State {
-    fn event(
-        _state: &mut State,
-        _surface: &WlSurface,
-        _event: wl_surface::Event,
-        _data: &(),
-             _conn: &Connection,
-             _qh: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<WlOutput, ()> for State {
-    fn event(
-        _state: &mut State,
-        _output: &WlOutput,
-        _event: wl_output::Event,
-        _data: &(),
-             _conn: &Connection,
-             _qh: &QueueHandle<State>,
-    ) {
-    }
-}
-
-impl Dispatch<ZwlrLayerShellV1, ()> for State {
-    fn event(
-        _state: &mut State,
-        _layer_shell: &ZwlrLayerShellV1,
-        _event: zwlr_layer_shell_v1::Event,
-        _data: &(),
-             _conn: &Connection,
-             _qh: &QueueHandle<State>,
-    ) {
     }
 }
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
-    fn event(
-        state: &mut State,
-        layer_surface: &ZwlrLayerSurfaceV1,
-        event: zwlr_layer_surface_v1::Event,
-        _data: &(),
-             _conn: &Connection,
-             _qh: &QueueHandle<State>,
-    ) {
-        let is_wallpaper = state
-        .wallpaper
-        .layer_surface
-        .as_ref()
-        .map(|ls| ls == layer_surface)
-        .unwrap_or(false);
+    fn event(state: &mut State, layer_surface: &ZwlrLayerSurfaceV1, event: zwlr_layer_surface_v1::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {
+        for monitor in &mut state.monitors {
+            let is_wp = monitor.wallpaper.layer_surface.as_ref().map(|ls| ls.id() == layer_surface.id()).unwrap_or(false);
+            let is_bd = monitor.backdrop.layer_surface.as_ref().map(|ls| ls.id() == layer_surface.id()).unwrap_or(false);
 
-        let ss = if is_wallpaper {
-            &mut state.wallpaper
-        } else {
-            &mut state.backdrop
-        };
+            let ss = if is_wp { Some(&mut monitor.wallpaper) } else if is_bd { Some(&mut monitor.backdrop) } else { None };
 
-        match event {
-            zwlr_layer_surface_v1::Event::Configure {
-                serial,
-                width,
-                height,
-            } => {
-                println!(
-                    "[{}] configure: serial={serial} width={width} height={height}",
-                    ss.namespace
-                );
-                ss.configure_serial = Some(serial);
-                ss.width = width;
-                ss.height = height;
+            if let Some(ss) = ss {
+                match event {
+                    zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                        println!("[{}] configure: serial={serial} width={width} height={height}", ss.namespace);
+                        ss.configure_serial = Some(serial);
+                        ss.width = width;
+                        ss.height = height;
+                    }
+                    zwlr_layer_surface_v1::Event::Closed => {
+                        println!("[{}] layer surface closed", ss.namespace);
+                        ss.closed = true;
+                    }
+                    _ => {}
+                }
+                break;
             }
-            zwlr_layer_surface_v1::Event::Closed => {
-                println!("[{}] layer surface closed", ss.namespace);
-                ss.closed = true;
-            }
-            _ => {}
         }
     }
 }
-
-impl Dispatch<WlCallback, ()> for State {
-    fn event(
-        _state: &mut State,
-        _callback: &WlCallback,
-        _event: wl_callback::Event,
-        _data: &(),
-             _conn: &Connection,
-             _qh: &QueueHandle<State>,
-    ) {
-    }
-}
-
-// ── Renderer entry point ───────────────────────────────────────────
 
 pub fn run(
     image: impl AsRef<std::path::Path>,
@@ -379,402 +248,197 @@ pub fn run(
 
     let mut event_queue: EventQueue<State> = conn.new_event_queue();
     let qh = event_queue.handle();
-
     let _registry = display.get_registry(&qh, ());
 
     let mut state = State {
         compositor: None,
         shm: None,
         layer_shell: None,
-        wallpaper: SurfaceState::new("wallpaper"),
-        backdrop: SurfaceState::new("wallman-backdrop"),
+        monitors: Vec::new(),
+        pending_outputs: Vec::new(),
+        monitor_names: HashMap::new(),
         current_mode: initial_mode,
     };
 
     event_queue.roundtrip(&mut state)?;
     event_queue.roundtrip(&mut state)?;
 
-    if state.compositor.is_none() {
-        return Err("wl_compositor global not found".into());
+    if state.compositor.is_none() { return Err("wl_compositor global not found".into()); }
+    if state.shm.is_none() { return Err("wl_shm global not found".into()); }
+    if state.layer_shell.is_none() { return Err("zwlr_layer_shell_v1 global not found".into()); }
+
+    // Create surfaces for all pending outputs
+    let compositor = state.compositor.as_ref().unwrap();
+    let layer_shell = state.layer_shell.as_ref().unwrap();
+    let pending_outputs = std::mem::take(&mut state.pending_outputs);
+
+    for output in pending_outputs {
+        let name = state.monitor_names.get(&output.id()).cloned().unwrap_or_else(|| format!("output-{}", output.id()));
+        let wp_surface = compositor.create_surface(&qh, ());
+        let wp_layer = layer_shell.get_layer_surface(&wp_surface, Some(&output), zwlr_layer_shell_v1::Layer::Background, "wallpaper".to_string(), &qh, ());
+        wp_layer.set_size(0, 0);
+        wp_layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+        wp_layer.set_exclusive_zone(-1);
+        wp_layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+
+        let bd_surface = compositor.create_surface(&qh, ());
+        let bd_layer = layer_shell.get_layer_surface(&bd_surface, Some(&output), zwlr_layer_shell_v1::Layer::Background, "wallman-backdrop".to_string(), &qh, ());
+        bd_layer.set_size(0, 0);
+        bd_layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+        bd_layer.set_exclusive_zone(-1);
+        bd_layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+
+        let mut wp_state = SurfaceState::new("wallpaper");
+        wp_state.surface = Some(wp_surface);
+        wp_state.layer_surface = Some(wp_layer);
+
+        let mut bd_state = SurfaceState::new("wallman-backdrop");
+        bd_state.surface = Some(bd_surface);
+        bd_state.layer_surface = Some(bd_layer);
+
+        state.monitors.push(Monitor {
+            name, // Will be updated by WlOutput::Name event
+            _output: output,
+            wallpaper: wp_state,
+            backdrop: bd_state,
+        });
     }
 
-    if state.shm.is_none() {
-        return Err("wl_shm global not found".into());
+    // Commit empty surfaces to trigger configure
+    for monitor in &state.monitors {
+        if let Some(s) = monitor.wallpaper.surface.as_ref() { s.commit(); }
+        if let Some(s) = monitor.backdrop.surface.as_ref() { s.commit(); }
     }
+    println!("created surfaces for {} monitor(s)", state.monitors.len());
 
-    if state.layer_shell.is_none() {
-        return Err("zwlr_layer_shell_v1 global not found".into());
-    }
-
-    // ── Create wallpaper surface ───────────────────────────────────
-    {
-        let surface = {
-            let compositor = state
-            .compositor
-            .as_ref()
-            .ok_or("wl_compositor not bound")?;
-            compositor.create_surface(&qh, ())
-        };
-        state.wallpaper.surface = Some(surface);
-    }
-    {
-        let layer_surface = {
-            let layer_shell = state
-            .layer_shell
-            .as_ref()
-            .ok_or("zwlr_layer_shell_v1 not bound")?;
-            let surface = state
-            .wallpaper
-            .surface
-            .as_ref()
-            .ok_or("wallpaper wl_surface not created")?;
-
-            layer_shell.get_layer_surface(
-                surface,
-                None::<&WlOutput>,
-                zwlr_layer_shell_v1::Layer::Background,
-                state.wallpaper.namespace.clone(),
-                                          &qh,
-                                          (),
-            )
-        };
-
-        layer_surface.set_size(0, 0);
-        layer_surface.set_anchor(
-            Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
-        );
-        layer_surface.set_exclusive_zone(-1);
-        layer_surface.set_keyboard_interactivity(
-            zwlr_layer_surface_v1::KeyboardInteractivity::None,
-        );
-
-        state.wallpaper.layer_surface = Some(layer_surface);
-        println!("[wallpaper] created layer surface");
-    }
-
-    // ── Create backdrop surface ────────────────────────────────────
-    {
-        let surface = {
-            let compositor = state
-            .compositor
-            .as_ref()
-            .ok_or("wl_compositor not bound")?;
-            compositor.create_surface(&qh, ())
-        };
-        state.backdrop.surface = Some(surface);
-    }
-    {
-        let layer_surface = {
-            let layer_shell = state
-            .layer_shell
-            .as_ref()
-            .ok_or("zwlr_layer_shell_v1 not bound")?;
-            let surface = state
-            .backdrop
-            .surface
-            .as_ref()
-            .ok_or("backdrop wl_surface not created")?;
-
-            layer_shell.get_layer_surface(
-                surface,
-                None::<&WlOutput>,
-                zwlr_layer_shell_v1::Layer::Background,
-                state.backdrop.namespace.clone(),
-                                          &qh,
-                                          (),
-            )
-        };
-
-        layer_surface.set_size(0, 0);
-        layer_surface.set_anchor(
-            Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
-        );
-        layer_surface.set_exclusive_zone(-1);
-        layer_surface.set_keyboard_interactivity(
-            zwlr_layer_surface_v1::KeyboardInteractivity::None,
-        );
-
-        state.backdrop.layer_surface = Some(layer_surface);
-        println!("[wallman-backdrop] created layer surface");
-    }
-
-    // ── Commit both empty surfaces to trigger configure ────────────
-    if let Some(ref surface) = state.wallpaper.surface {
-        surface.commit();
-    }
-    if let Some(ref surface) = state.backdrop.surface {
-        surface.commit();
-    }
-    println!("committed empty surfaces to request configure");
-
-    event_queue.roundtrip(&mut state)?;
-
-    // ── Wait for wallpaper configure ───────────────────────────────
+    // Wait for all configures
     let mut attempts = 0;
-    while state.wallpaper.configure_serial.is_none() && attempts < 10 {
+    while state.monitors.iter().any(|m| m.wallpaper.configure_serial.is_none() || m.backdrop.configure_serial.is_none()) && attempts < 10 {
         event_queue.roundtrip(&mut state)?;
         attempts += 1;
     }
 
-    let wp_serial = state
-    .wallpaper
-    .configure_serial
-    .take()
-    .ok_or("[wallpaper] no configure event received")?;
-    let wp_width = state.wallpaper.width;
-    let wp_height = state.wallpaper.height;
-
-    if wp_width == 0 || wp_height == 0 {
-        return Err("[wallpaper] configure event gave a zero size".into());
+    for monitor in &mut state.monitors {
+        let wp_serial = monitor.wallpaper.configure_serial.take().ok_or("no wallpaper configure")?;
+        let bd_serial = monitor.backdrop.configure_serial.take().ok_or("no backdrop configure")?;
+        if monitor.wallpaper.width == 0 || monitor.wallpaper.height == 0 { return Err("wallpaper zero size".into()); }
+        if monitor.backdrop.width == 0 || monitor.backdrop.height == 0 { return Err("backdrop zero size".into()); }
+        if let Some(ls) = monitor.wallpaper.layer_surface.as_ref() { ls.ack_configure(wp_serial); }
+        if let Some(ls) = monitor.backdrop.layer_surface.as_ref() { ls.ack_configure(bd_serial); }
     }
 
-    if let Some(ref ls) = state.wallpaper.layer_surface {
-        ls.ack_configure(wp_serial);
-        println!("[wallpaper] acknowledged configure serial={wp_serial}");
-    }
-
-    // ── Wait for backdrop configure ────────────────────────────────
-    let mut attempts = 0;
-    while state.backdrop.configure_serial.is_none() && attempts < 10 {
-        event_queue.roundtrip(&mut state)?;
-        attempts += 1;
-    }
-
-    let bd_serial = state
-    .backdrop
-    .configure_serial
-    .take()
-    .ok_or("[wallman-backdrop] no configure event received")?;
-    let bd_width = state.backdrop.width;
-    let bd_height = state.backdrop.height;
-
-    if bd_width == 0 || bd_height == 0 {
-        return Err("[wallman-backdrop] configure event gave a zero size".into());
-    }
-
-    if let Some(ref ls) = state.backdrop.layer_surface {
-        ls.ack_configure(bd_serial);
-        println!("[wallman-backdrop] acknowledged configure serial={bd_serial}");
-    }
-
-    // ── Spawn worker thread ────────────────────────────────────────
     let (worker_tx, worker_rx) = spawn_worker();
+    let shm = state.shm.as_ref().ok_or("wl_shm not bound")?.clone();
 
-    // ── Initial image processing (blocking is OK for first load) ───
-    let shm = state
-    .shm
-    .as_ref()
-    .ok_or("wl_shm not bound")?
-    .clone();
+    let jobs: Vec<MonitorJob> = state.monitors.iter().map(|m| MonitorJob {
+        name: m.name.clone(),
+                                                          path: image.as_ref().to_path_buf(),
+                                                          mode: state.current_mode.clone(),
+                                                          wp_width: m.wallpaper.width,
+                                                          wp_height: m.wallpaper.height,
+                                                          bd_width: m.backdrop.width,
+                                                          bd_height: m.backdrop.height,
+    }).collect();
 
-    worker_tx
-    .send(WorkerCommand::Process {
-        path: image.as_ref().to_path_buf(),
-          mode: state.current_mode.clone(),
-          wp_width,
-          wp_height,
-          bd_width,
-          bd_height,
-    })
-    .expect("Failed to send initial process command to worker");
+    worker_tx.send(WorkerCommand::Process { jobs }).expect("worker crashed");
 
-    let response = worker_rx
-    .recv()
-    .expect("Worker thread crashed during initial load");
-
-    match response {
-        WorkerResponse::Ready {
-            wallpaper_file,
-            backdrop_file,
-            wp_width,
-            wp_height,
-            bd_width,
-            bd_height,
-            mode,
-            colors,
-        } => {
-            prepare_surface(
-                &mut state.wallpaper,
-                &shm,
-                &qh,
-                wallpaper_file,
-                wp_width,
-                wp_height,
-            )?;
-            println!(
-                "[wallpaper] drew sharp image from {} (mode: {})",
-                     image.as_ref().display(),
-                     mode
-            );
-
-            prepare_surface(
-                &mut state.backdrop,
-                &shm,
-                &qh,
-                backdrop_file,
-                bd_width,
-                bd_height,
-            )?;
-            println!(
-                "[wallman-backdrop] drew blurred image from {} (mode: {})",
-                     image.as_ref().display(),
-                     mode
-            );
+    match worker_rx.recv().expect("worker crashed") {
+        WorkerResponse::Ready { colors, monitors: results } => {
             write_colors_file(&colors);
-            state.current_mode = mode;
+            for result in results {
+                if let Some(monitor) = state.monitors.iter_mut().find(|m| m.name == result.name) {
+                    prepare_surface(&mut monitor.wallpaper, &shm, &qh, result.wallpaper_file, result.wp_width, result.wp_height)?;
+                    prepare_surface(&mut monitor.backdrop, &shm, &qh, result.backdrop_file, result.bd_width, result.bd_height)?;
+                }
+            }
         }
-        WorkerResponse::Failed(e) => {
-            return Err(format!("Failed to process initial image: {e}").into());
-        }
+        WorkerResponse::Failed(e) => return Err(format!("initial process failed: {e}").into()),
     }
 
     event_queue.roundtrip(&mut state)?;
+    println!("Wallman renderer is running (multi-monitor)");
 
-    println!("Wallman renderer is running (wallpaper + blurred backdrop)");
-
-    // ── Event loop ─────────────────────────────────────────────────
     loop {
-        if state.wallpaper.closed || state.backdrop.closed {
-            break;
-        }
+        if state.monitors.iter().any(|m| m.wallpaper.closed || m.backdrop.closed) { break; }
 
-        // ── Handle IPC commands ────────────────────────────────────
         while let Ok(command) = receiver.try_recv() {
             match command {
                 RendererCommand::Reload => {
-                    let wp_w = state.wallpaper.width;
-                    let wp_h = state.wallpaper.height;
-                    let bd_w = state.backdrop.width;
-                    let bd_h = state.backdrop.height;
-                    let mode = state.current_mode.clone();
-
-                    let _ = worker_tx.send(WorkerCommand::Process {
-                        path: image.as_ref().to_path_buf(),
-                                           mode,
-                                           wp_width: wp_w,
-                                           wp_height: wp_h,
-                                           bd_width: bd_w,
-                                           bd_height: bd_h,
-                    });
+                    let jobs: Vec<MonitorJob> = state.monitors.iter().map(|m| MonitorJob {
+                        name: m.name.clone(),
+                                                                          path: image.as_ref().to_path_buf(),
+                                                                          mode: state.current_mode.clone(),
+                                                                          wp_width: m.wallpaper.width,
+                                                                          wp_height: m.wallpaper.height,
+                                                                          bd_width: m.backdrop.width,
+                                                                          bd_height: m.backdrop.height,
+                    }).collect();
+                    let _ = worker_tx.send(WorkerCommand::Process { jobs });
                 }
                 RendererCommand::SetWallpaper { image, mode } => {
-                    let wp_w = state.wallpaper.width;
-                    let wp_h = state.wallpaper.height;
-                    let bd_w = state.backdrop.width;
-                    let bd_h = state.backdrop.height;
-
-                    let _ = worker_tx.send(WorkerCommand::Process {
-                        path: image,
-                        mode,
-                        wp_width: wp_w,
-                        wp_height: wp_h,
-                        bd_width: bd_w,
-                        bd_height: bd_h,
-                    });
+                    state.current_mode = mode.clone();
+                    let jobs: Vec<MonitorJob> = state.monitors.iter().map(|m| MonitorJob {
+                        name: m.name.clone(),
+                                                                          path: image.clone(),
+                                                                          mode: mode.clone(),
+                                                                          wp_width: m.wallpaper.width,
+                                                                          wp_height: m.wallpaper.height,
+                                                                          bd_width: m.backdrop.width,
+                                                                          bd_height: m.backdrop.height,
+                    }).collect();
+                    let _ = worker_tx.send(WorkerCommand::Process { jobs });
                 }
             }
         }
 
-        // ── Handle worker responses ────────────────────────────────
         while let Ok(response) = worker_rx.try_recv() {
             match response {
-                WorkerResponse::Ready {
-                    wallpaper_file,
-                    backdrop_file,
-                    wp_width,
-                    wp_height,
-                    bd_width,
-                    bd_height,
-                    mode,
-                    colors,
-                } => {
+                WorkerResponse::Ready { colors, monitors: results } => {
+                    write_colors_file(&colors);
                     let shm = match state.shm.as_ref() {
                         Some(s) => s.clone(),
-                        None => {
-                            eprintln!("Failed to apply wallpaper: wl_shm not bound");
-                            continue;
-                        }
+                        None => { eprintln!("wl_shm lost"); continue; }
                     };
-
-                    if let Err(e) = prepare_surface(
-                        &mut state.wallpaper,
-                        &shm,
-                        &qh,
-                        wallpaper_file,
-                        wp_width,
-                        wp_height,
-                    ) {
-                        eprintln!("Failed to prepare wallpaper surface: {e}");
-                        continue;
+                    for result in results {
+                        if let Some(monitor) = state.monitors.iter_mut().find(|m| m.name == result.name) {
+                            if let Err(e) = prepare_surface(&mut monitor.wallpaper, &shm, &qh, result.wallpaper_file, result.wp_width, result.wp_height) {
+                                eprintln!("wp prep failed: {e}");
+                            }
+                            if let Err(e) = prepare_surface(&mut monitor.backdrop, &shm, &qh, result.backdrop_file, result.bd_width, result.bd_height) {
+                                eprintln!("bd prep failed: {e}");
+                            }
+                        }
                     }
-                    if let Err(e) = prepare_surface(
-                        &mut state.backdrop,
-                        &shm,
-                        &qh,
-                        backdrop_file,
-                        bd_width,
-                        bd_height,
-                    ) {
-                        eprintln!("Failed to prepare backdrop surface: {e}");
-                        continue;
-                    }
-                    write_colors_file(&colors);
-                    state.current_mode = mode;
                     println!("updated wallpaper (mode: {})", state.current_mode);
                 }
-                WorkerResponse::Failed(e) => {
-                    eprintln!("Failed to process image: {e}");
-                }
+                WorkerResponse::Failed(e) => eprintln!("process failed: {e}"),
             }
         }
 
         event_queue.dispatch_pending(&mut state)?;
         conn.flush()?;
 
-        // Ack any pending configure events
-        if let Some(serial) = state.wallpaper.configure_serial.take() {
-            if let Some(ref ls) = state.wallpaper.layer_surface {
-                ls.ack_configure(serial);
-                println!("[wallpaper] acknowledged configure serial={serial}");
+        for monitor in &mut state.monitors {
+            if let Some(serial) = monitor.wallpaper.configure_serial.take() {
+                if let Some(ls) = monitor.wallpaper.layer_surface.as_ref() { ls.ack_configure(serial); }
             }
-        }
-        if let Some(serial) = state.backdrop.configure_serial.take() {
-            if let Some(ref ls) = state.backdrop.layer_surface {
-                ls.ack_configure(serial);
-                println!("[wallman-backdrop] acknowledged configure serial={serial}");
+            if let Some(serial) = monitor.backdrop.configure_serial.take() {
+                if let Some(ls) = monitor.backdrop.layer_surface.as_ref() { ls.ack_configure(serial); }
             }
         }
 
-        let Some(read_guard) = event_queue.prepare_read() else {
-            continue;
-        };
-
+        let Some(read_guard) = event_queue.prepare_read() else { continue; };
         let fd = read_guard.connection_fd();
-        let mut fds = [libc::pollfd {
-            fd: std::os::fd::AsRawFd::as_raw_fd(&fd),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-
+        let mut fds = [libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(&fd), events: libc::POLLIN, revents: 0 }];
         let timeout_ms = 200;
         let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
-
         if ret < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                drop(read_guard);
-                continue;
-            }
+            if err.kind() == std::io::ErrorKind::Interrupted { drop(read_guard); continue; }
             drop(read_guard);
             return Err(err.into());
         }
-
-        if ret > 0 {
-            read_guard.read()?;
-        } else {
-            drop(read_guard);
-        }
+        if ret > 0 { read_guard.read()?; } else { drop(read_guard); }
     }
-
     Ok(())
 }
