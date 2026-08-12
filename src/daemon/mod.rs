@@ -54,16 +54,18 @@ impl Daemon {
                 Some("SET") => {
                     let Some(image) = parts.next() else {
                         eprintln!("Malformed IPC command: SET missing image path");
-                        return; // Safely ignores the bad command instead of crashing
+                        return;
                     };
                     let mode = parts.next().unwrap_or(&default_mode);
                     let monitor = parts.next().unwrap_or("");
+                    let blur: u32 = parts.next().and_then(|b| b.parse().ok()).unwrap_or(8);
 
                     renderer_sender
                     .send(crate::renderer::RendererCommand::SetWallpaper {
                         image: std::path::PathBuf::from(image),
                           mode: mode.to_string(),
                           monitor: monitor.to_string(),
+                          blur,
                     })
                     .expect("Failed to send wallpaper update to renderer");
                 }

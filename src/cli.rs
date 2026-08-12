@@ -30,6 +30,9 @@ pub enum Commands {
 
         #[arg(long)]
         monitor: Option<String>,
+
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=30))]
+        blur: Option<u32>,
     },
 
     #[command(about = "Run the wallpaper daemon")]

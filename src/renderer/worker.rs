@@ -12,6 +12,7 @@ pub struct MonitorJob {
     pub name: String,
     pub path: PathBuf,
     pub mode: String,
+    pub blur: u32,
     pub wp_width: u32,
     pub wp_height: u32,
     pub bd_width: u32,
@@ -132,7 +133,7 @@ fn process_images(
         let wp_pixels = rgba_to_xrgb(&sharp_rgba);
 
         let backdrop_rgba = resize(image, job.bd_width, job.bd_height);
-        let blurred_rgba = image::imageops::blur(&backdrop_rgba, 8.0);
+        let blurred_rgba = image::imageops::blur(&backdrop_rgba, job.blur as f32);
         let bd_pixels = rgba_to_xrgb(&blurred_rgba);
 
         let mut wp_file = create_shm_file("wallman-wallpaper", wp_pixels.len())?;

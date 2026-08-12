@@ -5,10 +5,14 @@ pub fn run(
     image: PathBuf,
     mode: Option<String>,
     monitor: Option<String>,
+    blur: Option<u32>,
 ) {
     let config = crate::config::load();
 
     let mode = mode.unwrap_or(config.mode);
+
+    let blur = blur.unwrap_or(config.blur);
+
 
     if !image.exists() {
         eprintln!("Error: '{}' does not exist.", image.display());
@@ -73,10 +77,11 @@ pub fn run(
 
     let ipc_monitor = monitor.unwrap_or_default();
     let command = format!(
-        "SET|{}|{}|{}",
+        "SET|{}|{}|{}|{}",
         cached_wallpaper.display(),
                           mode,
-                          ipc_monitor
+                          ipc_monitor,
+                          blur
     );
 
     crate::ipc::send_command(&command);

@@ -32,6 +32,7 @@ pub enum RendererCommand {
         image: std::path::PathBuf,
         mode: String,
         monitor: String, // empty string means all monitors
+        blur: u32,
     },
     Reload,
 }
@@ -85,6 +86,7 @@ struct State {
     current_mode: String, // Global default mode
     default_image: Option<std::path::PathBuf>, // Global default image
     monitor_overrides: HashMap<String, (std::path::PathBuf, String)>, // Per-monitor overrides
+    current_blur: u32,
 }
 
 fn prepare_surface(
@@ -242,7 +244,6 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
 
 fn build_jobs(state: &State) -> Vec<MonitorJob> {
     state.monitors.iter().filter_map(|m| {
-        // If this monitor has a specific override, use it. Otherwise, use the global default.
         let (path, mode) = if let Some((p, m_mode)) = state.monitor_overrides.get(&m.name) {
             (p.clone(), m_mode.clone())
         } else if let Some(p) = &state.default_image {
@@ -255,6 +256,7 @@ fn build_jobs(state: &State) -> Vec<MonitorJob> {
             name: m.name.clone(),
              path,
              mode,
+             blur: state.current_blur,
              wp_width: m.wallpaper.width,
              wp_height: m.wallpaper.height,
              bd_width: m.backdrop.width,
@@ -286,6 +288,7 @@ pub fn run(
         current_mode: initial_mode.clone(),
         default_image: Some(image.as_ref().to_path_buf()),
         monitor_overrides: HashMap::new(),
+        current_blur: 8,
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -362,6 +365,7 @@ pub fn run(
         name: m.name.clone(),
                                                           path: image.as_ref().to_path_buf(),
                                                           mode: state.current_mode.clone(),
+                                                          blur: state.current_blur,
                                                           wp_width: m.wallpaper.width,
                                                           wp_height: m.wallpaper.height,
                                                           bd_width: m.backdrop.width,
@@ -400,17 +404,15 @@ pub fn run(
                         let _ = worker_tx.send(WorkerCommand::Process { jobs });
                     }
                 }
-                RendererCommand::SetWallpaper { image, mode, monitor } => {
+                RendererCommand::SetWallpaper { image, mode, monitor, blur } => {
+                    state.current_blur = blur;
+
                     if monitor.is_empty() {
-                        // Global update: set default and clear any per-monitor overrides
                         state.default_image = Some(image.clone());
                         state.current_mode = mode.clone();
                         state.monitor_overrides.clear();
-                        println!("Setting global wallpaper: {}", image.display());
                     } else {
-                        // Per-monitor update
                         state.monitor_overrides.insert(monitor.clone(), (image.clone(), mode.clone()));
-                        println!("Setting wallpaper for monitor {}: {}", monitor, image.display());
                     }
 
                     let jobs = build_jobs(&state);

@@ -1,55 +1,47 @@
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
+    #[serde(default = "default_mode")]
     pub mode: String,
+
+    #[serde(default = "default_blur")]
+    pub blur: u32,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            mode: "fill".into(),
-        }
-    }
+fn default_mode() -> String {
+    "fill".to_string()
+}
+
+fn default_blur() -> u32 {
+    8
+}
+
+pub fn config_path() -> PathBuf {
+    let dirs = directories::ProjectDirs::from("", "", "wallman")
+    .expect("Failed to determine config directory");
+    dirs.config_dir().join("config.toml")
 }
 
 pub fn load() -> Config {
-    let project_dirs =
-        ProjectDirs::from("", "", "wallman")
-            .expect("Failed to determine config directory");
-
-    let config_path = project_dirs
-        .config_dir()
-        .join("config.toml");
-
-    match fs::read_to_string(&config_path) {
-        Ok(contents) => {
-            toml::from_str(&contents)
-                .unwrap_or_else(|_| Config::default())
-        }
-
-        Err(_) => Config::default(),
+    let path = config_path();
+    if !path.exists() {
+        return Config {
+            mode: default_mode(),
+            blur: default_blur(),
+        };
     }
+    let content = fs::read_to_string(&path).expect("Failed to read config");
+    toml::from_str(&content).expect("Failed to parse config")
 }
 
 pub fn save(config: &Config) {
-    let project_dirs =
-    ProjectDirs::from("", "", "wallman")
-    .expect("Failed to determine config directory");
-
-    let config_dir = project_dirs.config_dir();
-
-    fs::create_dir_all(config_dir)
-    .expect("Failed to create config directory");
-
-    let config_path = config_dir.join("config.toml");
-
-    let contents =
-    toml::to_string_pretty(config)
-    .expect("Failed to serialize config");
-
-    fs::write(config_path, contents)
-    .expect("Failed to write config");
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create config directory");
+    }
+    let content = toml::to_string_pretty(config).expect("Failed to serialize config");
+    fs::write(&path, content).expect("Failed to write config");
 }
