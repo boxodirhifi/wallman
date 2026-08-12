@@ -1,313 +1,84 @@
-# Wallman
+# Wallman 🖼️
 
-A lightweight, native Wayland wallpaper manager written in Rust.
+A lightning-fast, native Wayland wallpaper manager built in Rust. 
 
-Wallman renders wallpapers directly through Wayland instead of relying on external wallpaper backends such as `swaybg`. It also provides a blurred backdrop layer for desktop environments/compositors that expose an overview-style interface, such as Niri.
+Wallman was designed specifically to solve the "Overview Backdrop" problem in compositors like Niri, while providing a robust, multi-monitor architecture for power users.
 
-## Features
+## ✨ Features
 
-* Native Wayland rendering
-* Lightweight background daemon
-* No dependency on `swaybg`
-* Multi-monitor support
-* Per-monitor wallpapers
-* Automatic wallpaper restoration after restart
-* Blurred overview/backdrop layer
-* Configurable blur processing
-* Multiple scaling modes:
+* **Native Wayland Rendering:** Zero reliance on legacy X11 tools or heavy external daemons like `swaybg`. Uses `zwlr_layer_shell_v1` directly.
+* **The Niri Overview Backdrop:** Automatically generates a blurred version of your wallpaper and renders it on a separate background layer, giving the Niri Overview a beautiful, native blurred backdrop.
+* **Configurable Blur Radius:** Tune the blur intensity to your exact taste (1–30) via the `--blur` flag.
+* **Stutter-Free Architecture:** Heavy image processing (Lanczos3 resizing, Gaussian blurring) runs on a dedicated background worker thread. Your Wayland event loop never freezes, even with massive 4K/8K images.
+* **Color Extraction:** Automatically extracts a 5-color palette from your wallpaper and writes it to `~/.cache/wallman/colors.toml` for easy integration with Waybar, terminals, and window borders.
+* **Per-Monitor Wallpapers:** Set different wallpapers for different screens using the `--monitor` flag.
+* **Smart Scaling:** Supports `fill`, `fit`, `stretch`, and `center` modes natively.
 
-  * `fill`
-  * `fit`
-  * `stretch`
-  * `center`
-* Background image processing using a worker thread
-* Color extraction from wallpapers
-* IPC-based wallpaper updates
-* CLI for controlling the daemon
-* Graceful handling of invalid images
-* Native shared-memory (`wl_shm`) buffers
-* Designed specifically for Linux/Wayland
+## 🚀 Installation
 
-## How It Works
-
-Wallman consists of three main parts:
-
-```text
-CLI
- │
- │ IPC
- ▼
-Daemon
- │
- ├── Worker thread
- │    └── Image decoding / resizing / blur / color extraction
- │
- ▼
-Wayland Renderer
- │
- ├── Wallpaper surface
- │
- └── Blurred backdrop surface
-```
-
-The Wayland renderer remains responsible for compositor communication and buffer management, while expensive image processing is performed outside the Wayland event loop.
-
-This prevents large images from blocking compositor communication while they are being decoded, resized, or blurred.
-
-## Installation
-
-Clone the repository:
+Currently installable via Cargo:
 
 ```bash
-git clone https://github.com/boxodirhifi/wallman.git
-cd wallman
+cargo install --git https://github.com/boxodirhifi/wallman.git
 ```
 
-Install with Cargo:
+*(Ensure your Cargo `bin` directory is in your `$PATH`)*
 
-```bash
-cargo install --path .
-```
+## 🛠️ Usage
 
-Verify the installation:
-
-```bash
-wallman --help
-```
-
-## Usage
-
-Start the daemon:
-
+### Start the Daemon
+Wallman runs a lightweight daemon to manage the Wayland surfaces. Add this to your compositor's autostart:
 ```bash
 wallman daemon
 ```
 
-Set a wallpaper:
-
+### Set a Global Wallpaper
+Applies the wallpaper to all connected monitors.
 ```bash
-wallman set ~/Pictures/wallpaper.jpg
+wallman set ~/Pictures/landscape.jpg --mode fill
 ```
 
-Choose a scaling mode:
-
+### Customize the Blur
+Controls the blur intensity for the Niri Overview backdrop (1–30, default is 8).
 ```bash
-wallman set ~/Pictures/wallpaper.jpg --mode fill
-wallman set ~/Pictures/wallpaper.jpg --mode fit
-wallman set ~/Pictures/wallpaper.jpg --mode stretch
-wallman set ~/Pictures/wallpaper.jpg --mode center
+# Subtle blur
+wallman set ~/Pictures/landscape.jpg --blur 3
+
+# Heavy blur
+wallman set ~/Pictures/landscape.jpg --blur 15
 ```
 
-Reload the current wallpaper:
+### Set a Per-Monitor Wallpaper
+Target a specific output (e.g., `eDP-1`, `DP-2`). Other monitors will keep their global wallpaper.
+```bash
+wallman set ~/Pictures/portrait.jpg --mode fit --monitor eDP-1
+```
 
+### Reload & Stop
 ```bash
 wallman reload
-```
-
-Check daemon status:
-
-```bash
-wallman status
-```
-
-Stop the daemon:
-
-```bash
 wallman stop
 ```
 
-## Multi-Monitor Support
+## 🎨 Color Extraction & Theming
 
-Wallman supports multiple Wayland outputs and can assign wallpapers independently to different monitors.
+Every time you set a wallpaper, Wallman extracts the dominant colors and saves them to `~/.cache/wallman/colors.toml`:
 
-For example:
-
-```bash
-wallman set ~/Pictures/main.jpg --monitor DP-1
-wallman set ~/Pictures/secondary.jpg --monitor HDMI-A-1
+```toml
+# ~/.cache/wallman/colors.toml
+primary = "#233b28"
+secondary = "#b4a88d"
+tertiary = "#57826b"
+quaternary = "#7aa88d"
+quinary = "#8d9c9c"
 ```
 
-Each monitor gets its own wallpaper surface and rendering state.
+You can use a simple script in your compositor config to reload your tools (like Waybar or your terminal) whenever this file changes to instantly theme your desktop to match your wallpaper!
 
-This allows different wallpapers, scaling modes, and processing results to be maintained independently per output.
+## 🐧 Compositor Compatibility
 
-## Scaling Modes
-
-Wallman supports four wallpaper scaling modes.
-
-### `fill`
-
-Scales the image while preserving its aspect ratio and crops the excess so the entire surface is filled.
-
-### `fit`
-
-Scales the image while preserving its aspect ratio and places it inside the surface without cropping.
-
-### `stretch`
-
-Stretches the image to exactly match the output dimensions.
-
-### `center`
-
-Displays the image at its original dimensions, centered on the output.
-
-The default mode is `fill`.
-
-## Blurred Backdrop
-
-Wallman can maintain a second Wayland layer containing a blurred version of the current wallpaper.
-
-```text
-┌──────────────────────────────┐
-│                              │
-│      Desktop Wallpaper       │
-│          sharp               │
-│                              │
-├──────────────────────────────┤
-│                              │
-│     Overview / Backdrop      │
-│          blurred             │
-│                              │
-└──────────────────────────────┘
-```
-
-The backdrop is processed independently from the sharp wallpaper and is intended for compositor interfaces such as Niri's overview.
-
-## Image Processing
-
-Image processing is performed by a worker thread so expensive operations do not block the Wayland event loop.
-
-The processing pipeline includes:
-
-```text
-Image
-  │
-  ├── Decode
-  │
-  ├── Resize
-  │
-  ├── Wallpaper output
-  │
-  ├── Backdrop resize
-  │
-  ├── Blur
-  │
-  └── Color extraction
-```
-
-The worker produces processed pixel data while the renderer remains responsible for creating and attaching Wayland buffers.
-
-This architecture is particularly useful when dealing with large 4K/8K source images.
-
-## Color Extraction
-
-Wallman extracts representative colors from wallpapers and stores the resulting information for use by other components or future theming features.
-
-This allows Wallman to eventually provide wallpaper-aware theming without requiring another image-processing application.
-
-## Architecture
-
-Wallman is intentionally split into separate responsibilities:
-
-```text
-src/
-├── cli.rs
-├── commands/
-│   ├── set.rs
-│   └── config.rs
-├── config/
-├── daemon/
-├── ipc/
-└── renderer/
-```
-
-### CLI
-
-Provides the user-facing interface for setting wallpapers, managing configuration, and communicating with the daemon.
-
-### Daemon
-
-Runs continuously in the background and receives wallpaper commands through IPC.
-
-### IPC
-
-Provides local communication between the CLI and the daemon through a Unix socket.
-
-### Renderer
-
-Handles Wayland objects, layer-shell surfaces, shared-memory buffers, output management, and compositor events.
-
-### Worker
-
-Handles CPU-intensive image processing without blocking the Wayland event loop.
-
-## Why Rust?
-
-Wallman is written in Rust because it provides:
-
-* Low memory overhead
-* Native performance
-* Strong memory and thread safety
-* Excellent Linux/Wayland ecosystem support
-* No garbage collector
-* A good fit for a long-running system daemon
-
-The goal is to keep Wallman small, predictable, and efficient.
-
-## Compositor Compatibility
-
-Wallman is built around standard Wayland protocols and `wlr-layer-shell`.
-
-It is primarily designed for Wayland compositors supporting:
-
-* `wl_shm`
-* `wlr-layer-shell`
-
-Some features, particularly the blurred backdrop, depend on how the compositor handles layer-shell surfaces.
-
-Niri is currently the primary environment used for development and testing.
-
-## Configuration
-
-Wallman provides configuration through its CLI:
-
-```bash
-wallman config
-```
-
-For example, the default scaling mode can be changed with:
-
-```bash
-wallman config mode fill
-```
-
-Run:
-
-```bash
-wallman config --help
-```
-
-for the available configuration options.
-
-## Development
-
-Build:
-
-```bash
-cargo build
-```
-
-Check the project:
-
-```bash
-cargo check
-```
-
-Run directly:
-
-```bash
-cargo run -- daemon
-```
+* **Niri:** Fully supported. Wallman's signature blurred backdrop layer integrates perfectly with the Niri Overview.
+* **Hyprland / Sway:** Fully supported via the standard `layer-shell` protocol.
 
 ## Roadmap
 
@@ -329,9 +100,10 @@ cargo run -- daemon
 * [x] Per-monitor wallpapers
 * [x] Per-output rendering architecture
 
-### Future
+### v1.2
 
-* [ ] More compositor-specific integrations
+* [x] Configurable blur radius
+* [ ] Monitor hotplugging support
 * [ ] Additional image-processing options
 * [ ] Further performance optimizations
 * [ ] More advanced per-monitor configuration
@@ -339,14 +111,6 @@ cargo run -- daemon
 
 The project intentionally avoids adding unnecessary features simply for the sake of complexity. The priority is keeping Wallman lightweight, native, reliable, and fast.
 
-## License
+---
 
-Wallman is licensed under the GNU General Public License v3.0.
-
-See [`LICENSE`](LICENSE) for the full license text.
-
-## Repository
-
-GitHub:
-
-https://github.com/boxodirhifi/wallman
+**License:** GPL-3.0
