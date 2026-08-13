@@ -1,3 +1,3 @@
 pub fn run() {
-    crate::ipc::send_command("RELOAD");
+    crate::ipc::send_command(&crate::ipc::Command::Reload);
 }

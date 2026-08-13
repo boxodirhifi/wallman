@@ -76,13 +76,14 @@ pub fn run(
     );
 
     let ipc_monitor = monitor.unwrap_or_default();
-    let command = format!(
-        "SET|{}|{}|{}|{}",
-        cached_wallpaper.display(),
-                          mode,
-                          ipc_monitor,
-                          blur
-    );
+
+    // Create our strongly-typed JSON command instead of a formatted string
+    let command = crate::ipc::Command::Set {
+        image: cached_wallpaper.display().to_string(),
+        mode,
+        monitor: ipc_monitor,
+        blur,
+    };
 
     crate::ipc::send_command(&command);
 }

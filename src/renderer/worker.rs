@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::collections::HashMap;
+use image::GenericImageView;
 
 #[derive(Clone)]
 pub struct MonitorJob {
@@ -116,11 +117,35 @@ fn process_images(
                 .resize_exact(w, h, image::imageops::FilterType::Lanczos3)
                 .to_rgba8(),
                 "center" => {
-                    let resized = img.to_rgba8();
+                    let (img_w, img_h) = img.dimensions();
                     let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
-                    let x = (w as i32 - resized.width() as i32) / 2;
-                    let y = (h as i32 - resized.height() as i32) / 2;
-                    image::imageops::overlay(&mut bg, &resized, x as i64, y as i64);
+
+                    // 1. Calculate crop boundaries if image is LARGER than screen
+                    let crop_x = if img_w > w { (img_w - w) / 2 } else { 0 };
+                    let crop_y = if img_h > h { (img_h - h) / 2 } else { 0 };
+                    let crop_w = img_w.min(w);
+                    let crop_h = img_h.min(h);
+
+                    // 2. Crop the image
+                    let cropped = image::imageops::crop_imm(img, crop_x, crop_y, crop_w, crop_h).to_image();
+
+                    // 3. Calculate paste offset if image is SMALLER than screen
+                    let paste_x = if img_w < w { (w - img_w) / 2 } else { 0 };
+                    let paste_y = if img_h < h { (h - img_h) / 2 } else { 0 };
+
+                    // 4. Overlay the cropped/centered image
+                    image::imageops::overlay(&mut bg, &cropped, paste_x as i64, paste_y as i64);
+                    bg
+                }
+                "tile" => {
+                    let (img_w, img_h) = img.dimensions();
+                    let mut bg = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
+                    // Stamp the image across the background canvas
+                    for y in (0..h).step_by(img_h as usize) {
+                        for x in (0..w).step_by(img_w as usize) {
+                            image::imageops::overlay(&mut bg, img, x as i64, y as i64);
+                        }
+                    }
                     bg
                 }
                 _ => img
