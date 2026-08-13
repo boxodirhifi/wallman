@@ -157,8 +157,26 @@ fn process_images(
         let sharp_rgba = resize(image, job.wp_width, job.wp_height);
         let wp_pixels = rgba_to_xrgb(&sharp_rgba);
 
-        let backdrop_rgba = resize(image, job.bd_width, job.bd_height);
-        let blurred_rgba = image::imageops::blur(&backdrop_rgba, job.blur as f32);
+        // Downscale before blur for 4x speedup, then upscale back
+        let bd_scale = 2u32; // Change to 3 for more speed, less quality
+        let small_bd_w = job.bd_width / bd_scale;
+        let small_bd_h = job.bd_height / bd_scale;
+
+        // 1. Resize to small dimensions
+        let small_backdrop = resize(image, small_bd_w, small_bd_h);
+
+        // 2. Blur the small image (radius scaled down proportionally)
+        let scaled_blur = (job.blur as f32) / bd_scale as f32;
+        let small_blurred = image::imageops::blur(&small_backdrop, scaled_blur);
+
+        // 3. Upscale back to full size with Lanczos3 (smooth, no blocky artifacts)
+        let blurred_rgba = image::imageops::resize(
+            &small_blurred,
+            job.bd_width,
+            job.bd_height,
+            image::imageops::FilterType::Lanczos3,
+        );
+
         let bd_pixels = rgba_to_xrgb(&blurred_rgba);
 
         let mut wp_file = create_shm_file("wallman-wallpaper", wp_pixels.len())?;
