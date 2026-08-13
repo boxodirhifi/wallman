@@ -10,9 +10,13 @@ Wallman was designed specifically to solve the "Overview Backdrop" problem in co
 * **The Niri Overview Backdrop:** Automatically generates a blurred version of your wallpaper and renders it on a separate background layer, giving the Niri Overview a beautiful, native blurred backdrop.
 * **Configurable Blur Radius:** Tune the blur intensity to your exact taste (1–30) via the `--blur` flag.
 * **Stutter-Free Architecture:** Heavy image processing (Lanczos3 resizing, Gaussian blurring) runs on a dedicated background worker thread. Your Wayland event loop never freezes, even with massive 4K/8K images.
+* **Battery-Friendly Event Loop:** Powered by `calloop`, the daemon sleeps at exactly **0% CPU usage** when idle, waking up only when Wayland or IPC events occur.
 * **Color Extraction:** Automatically extracts a 5-color palette from your wallpaper and writes it to `~/.cache/wallman/colors.toml` for easy integration with Waybar, terminals, and window borders.
 * **Per-Monitor Wallpapers:** Set different wallpapers for different screens using the `--monitor` flag.
-* **Smart Scaling:** Supports `fill`, `fit`, `stretch`, and `center` modes natively.
+* **Hotplug Support:** Dynamically creates or destroys Wayland surfaces when you plug in or unplug displays.
+* **Persistent State:** Remembers your custom scaling modes and blur settings for individual monitors across daemon restarts.
+* **Secure & Robust IPC:** Type-safe JSON communication over strictly permissioned (`0o600`) Unix sockets, with graceful signal handling (`SIGTERM`/`SIGINT`) for clean systemd shutdowns.
+* **Smart Scaling:** Supports `fill`, `fit`, `stretch`, `center`, and `tile` modes natively.
 
 ## 🚀 Installation
 
@@ -52,6 +56,12 @@ wallman set ~/Pictures/landscape.jpg --blur 15
 Target a specific output (e.g., `eDP-1`, `DP-2`). Other monitors will keep their global wallpaper.
 ```bash
 wallman set ~/Pictures/portrait.jpg --mode fit --monitor eDP-1
+```
+
+### Tile a Texture
+Seamlessly repeat a pattern or texture across the screen.
+```bash
+wallman set ~/Textures/grid.png --mode tile
 ```
 
 ### Reload & Stop
@@ -103,10 +113,10 @@ You can use a simple script in your compositor config to reload your tools (like
 ### v1.2
 
 * [x] Configurable blur radius
-* [ ] Monitor hotplugging support
+* [x] Monitor hotplugging support
 * [ ] Additional image-processing options
-* [ ] Further performance optimizations
-* [ ] More advanced per-monitor configuration
+* [x] Further performance optimizations (0% CPU idle via `calloop`)
+* [x] More advanced per-monitor configuration (persistent modes & blur)
 * [ ] Additional theming integrations
 
 The project intentionally avoids adding unnecessary features simply for the sake of complexity. The priority is keeping Wallman lightweight, native, reliable, and fast.
