@@ -44,7 +44,7 @@ impl Daemon {
             println!("Restoring {} per-monitor wallpaper(s)...", monitor_overrides.len());
         }
 
-        let (renderer_sender, renderer_receiver) = std::sync::mpsc::channel();
+        let (renderer_sender, renderer_receiver) = calloop::channel::channel();
         let renderer_image = cached_wallpaper.clone();
         let renderer_mode = default_mode.clone();
 

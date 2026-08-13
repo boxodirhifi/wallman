@@ -44,9 +44,9 @@ pub enum WorkerResponse {
     Failed(String),
 }
 
-pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResponse>) {
+pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, calloop::channel::Channel<WorkerResponse>) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let (resp_tx, resp_rx) = mpsc::channel();
+    let (resp_tx, resp_rx) = calloop::channel::channel();
 
     thread::spawn(move || {
         while let Ok(cmd) = cmd_rx.recv() {

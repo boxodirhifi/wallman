@@ -3,7 +3,6 @@ mod worker;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
-use std::sync::mpsc::Receiver;
 
 use wayland_client::{
     backend::ObjectId,
@@ -27,11 +26,14 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 use worker::{spawn_worker, WorkerCommand, WorkerResponse, MonitorJob};
 
+use calloop::generic::Generic;
+use calloop::{EventLoop, Interest, Mode, PostAction};
+
 pub enum RendererCommand {
     SetWallpaper {
         image: std::path::PathBuf,
         mode: String,
-        monitor: String, // empty string means all monitors
+        monitor: String,
         blur: u32,
     },
     Reload,
@@ -320,7 +322,6 @@ fn setup_pending_outputs(
         });
     }
 
-    // Commit empty surfaces to trigger configure
     for monitor in &state.monitors {
         if monitor.wallpaper.configure_serial.is_none() {
             if let Some(s) = monitor.wallpaper.surface.as_ref() { s.commit(); }
@@ -330,7 +331,6 @@ fn setup_pending_outputs(
         }
     }
 
-    // Wait for all configures
     let mut attempts = 0;
     while state.monitors.iter().any(|m| m.wallpaper.configure_serial.is_none() || m.backdrop.configure_serial.is_none()) && attempts < 10 {
         event_queue.roundtrip(state)?;
@@ -354,7 +354,7 @@ pub fn run(
     initial_mode: String,
     initial_blur: u32,
     initial_overrides: HashMap<String, (std::path::PathBuf, String)>,
-           receiver: Receiver<RendererCommand>,
+    receiver: calloop::channel::Channel<RendererCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Wallman renderer started");
     let conn = Connection::connect_to_env()?;
@@ -384,20 +384,15 @@ pub fn run(
     if state.shm.is_none() { return Err("wl_shm global not found".into()); }
     if state.layer_shell.is_none() { return Err("zwlr_layer_shell_v1 global not found".into()); }
 
-    // Setup initial monitors
     setup_pending_outputs(&mut state, &mut event_queue, &qh)?;
     println!("created surfaces for {} monitor(s)", state.monitors.len());
 
     let (worker_tx, worker_rx) = spawn_worker();
     let shm = state.shm.as_ref().ok_or("wl_shm not bound")?.clone();
 
-    // Build jobs from the current state
     let jobs = build_jobs(&state);
-
-    // Send the process command exactly once
     worker_tx.send(WorkerCommand::Process { jobs }).expect("worker thread crashed");
 
-    // Wait for the worker to finish this specific batch
     match worker_rx.recv().expect("worker thread crashed") {
         WorkerResponse::Ready { colors, monitors: results } => {
             write_colors_file(&colors);
@@ -421,31 +416,32 @@ pub fn run(
     event_queue.roundtrip(&mut state)?;
     println!("Wallman renderer is running (multi-monitor)");
 
-    loop {
-        if state.monitors.iter().any(|m| m.wallpaper.closed || m.backdrop.closed) { break; }
+    // --- calloop event loop replaces the manual poll loop ---
+    let mut event_loop: EventLoop<State> = EventLoop::try_new().unwrap();
+    let handle = event_loop.handle();
+    let loop_signal = event_loop.get_signal();
 
-        // Check for newly plugged-in monitors
-        if !state.pending_outputs.is_empty() {
-            if let Ok(true) = setup_pending_outputs(&mut state, &mut event_queue, &qh) {
-                println!("Detected new monitor! Setting up surfaces...");
-                let jobs = build_jobs(&state);
-                if !jobs.is_empty() {
-                    let _ = worker_tx.send(WorkerCommand::Process { jobs });
-                }
-            }
-        }
+    // Clone handles for closures
+    let qh_worker = qh.clone();
+    let shm_worker = shm.clone();
+    let worker_tx_ipc = worker_tx.clone();
+    let worker_tx_wl = worker_tx.clone();
+    let qh_wl = qh.clone();
+    let signal_wl = loop_signal.clone();
+    let conn_idle = conn.clone();
 
-        while let Ok(command) = receiver.try_recv() {
+    // Register IPC command channel
+    handle.insert_source(receiver, move |event, _, state| {
+        if let calloop::channel::Event::Msg(command) = event {
             match command {
                 RendererCommand::Reload => {
-                    let jobs = build_jobs(&state);
+                    let jobs = build_jobs(state);
                     if !jobs.is_empty() {
-                        let _ = worker_tx.send(WorkerCommand::Process { jobs });
+                        let _ = worker_tx_ipc.send(WorkerCommand::Process { jobs });
                     }
                 }
                 RendererCommand::SetWallpaper { image, mode, monitor, blur } => {
                     state.current_blur = blur;
-
                     if monitor.is_empty() {
                         state.default_image = Some(image.clone());
                         state.current_mode = mode.clone();
@@ -453,63 +449,94 @@ pub fn run(
                     } else {
                         state.monitor_overrides.insert(monitor.clone(), (image.clone(), mode.clone()));
                     }
-
-                    let jobs = build_jobs(&state);
+                    let jobs = build_jobs(state);
                     if !jobs.is_empty() {
-                        let _ = worker_tx.send(WorkerCommand::Process { jobs });
+                        let _ = worker_tx_ipc.send(WorkerCommand::Process { jobs });
                     }
                 }
             }
         }
+    }).unwrap();
 
-        while let Ok(response) = worker_rx.try_recv() {
-            match response {
-                WorkerResponse::Ready { colors, monitors: results } => {
-                    write_colors_file(&colors);
-                    let shm = match state.shm.as_ref() {
-                        Some(s) => s.clone(),
-                        None => { eprintln!("wl_shm lost"); continue; }
-                    };
-                    for result in results {
-                        if let Some(monitor) = state.monitors.iter_mut().find(|m| m.name == result.name) {
-                            if let Err(e) = prepare_surface(&mut monitor.wallpaper, &shm, &qh, result.wallpaper_file, result.wp_width, result.wp_height) {
-                                eprintln!("wp prep failed: {e}");
-                            }
-                            if let Err(e) = prepare_surface(&mut monitor.backdrop, &shm, &qh, result.backdrop_file, result.bd_width, result.bd_height) {
-                                eprintln!("bd prep failed: {e}");
+    // Register worker response channel
+    handle.insert_source(worker_rx, move |event, _, state| {
+        match event {
+            calloop::channel::Event::Msg(response) => {
+                match response {
+                    WorkerResponse::Ready { colors, monitors: results } => {
+                        write_colors_file(&colors);
+                        for result in results {
+                            if let Some(monitor) = state.monitors.iter_mut().find(|m| m.name == result.name) {
+                                if let Err(e) = prepare_surface(&mut monitor.wallpaper, &shm_worker, &qh_worker, result.wallpaper_file, result.wp_width, result.wp_height) {
+                                    eprintln!("wp prep failed: {e}");
+                                }
+                                if let Err(e) = prepare_surface(&mut monitor.backdrop, &shm_worker, &qh_worker, result.backdrop_file, result.bd_width, result.bd_height) {
+                                    eprintln!("bd prep failed: {e}");
+                                }
                             }
                         }
+                        println!("updated wallpaper (mode: {})", state.current_mode);
                     }
-                    println!("updated wallpaper (mode: {})", state.current_mode);
+                    WorkerResponse::Failed(e) => eprintln!("process failed: {e}"),
                 }
-                WorkerResponse::Failed(e) => eprintln!("process failed: {e}"),
+            }
+            calloop::channel::Event::Closed => {
+                eprintln!("Worker channel closed unexpectedly");
             }
         }
+    }).unwrap();
 
-        event_queue.dispatch_pending(&mut state)?;
-        conn.flush()?;
+    // Use the Connection directly, since it implements AsFd
+    let conn_source = conn.clone();
+    handle.insert_source(
+        Generic::new(conn_source, Interest::READ, Mode::Level),
+                         move |_, _, state| {
+                             if let Err(e) = event_queue.dispatch_pending(state) {
+                                 eprintln!("Wayland dispatch error: {e}");
+                                 signal_wl.stop();
+                                 return Ok(PostAction::Continue);
+                             }
 
-        for monitor in &mut state.monitors {
-            if let Some(serial) = monitor.wallpaper.configure_serial.take() {
-                if let Some(ls) = monitor.wallpaper.layer_surface.as_ref() { ls.ack_configure(serial); }
-            }
-            if let Some(serial) = monitor.backdrop.configure_serial.take() {
-                if let Some(ls) = monitor.backdrop.layer_surface.as_ref() { ls.ack_configure(serial); }
-            }
-        }
+                             if state.monitors.iter().any(|m| m.wallpaper.closed || m.backdrop.closed) {
+                                 signal_wl.stop();
+                                 return Ok(PostAction::Continue);
+                             }
 
-        let Some(read_guard) = event_queue.prepare_read() else { continue; };
-        let fd = read_guard.connection_fd();
-        let mut fds = [libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(&fd), events: libc::POLLIN, revents: 0 }];
-        let timeout_ms = 200;
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted { drop(read_guard); continue; }
-            drop(read_guard);
-            return Err(err.into());
-        }
-        if ret > 0 { read_guard.read()?; } else { drop(read_guard); }
-    }
+                             if !state.pending_outputs.is_empty() {
+                                 if let Ok(true) = setup_pending_outputs(state, &mut event_queue, &qh_wl) {
+                                     println!("Detected new monitor! Setting up surfaces...");
+                                     let jobs = build_jobs(state);
+                                     if !jobs.is_empty() {
+                                         let _ = worker_tx_wl.send(WorkerCommand::Process { jobs });
+                                     }
+                                 }
+                             }
+
+                             for monitor in &mut state.monitors {
+                                 if let Some(serial) = monitor.wallpaper.configure_serial.take() {
+                                     if let Some(ls) = monitor.wallpaper.layer_surface.as_ref() { ls.ack_configure(serial); }
+                                 }
+                                 if let Some(serial) = monitor.backdrop.configure_serial.take() {
+                                     if let Some(ls) = monitor.backdrop.layer_surface.as_ref() { ls.ack_configure(serial); }
+                                 }
+                             }
+
+                             if let Some(read_guard) = event_queue.prepare_read() {
+                                 if let Err(e) = read_guard.read() {
+                                     eprintln!("Wayland read error: {e}");
+                                     signal_wl.stop();
+                                     return Ok(PostAction::Continue);
+                                 }
+                             }
+
+                             Ok(PostAction::Continue)
+                         }
+    ).unwrap();
+
+    // Run the event loop — sleeps at 0% CPU when idle
+    event_loop.run(None, &mut state, |_state| {
+        let _ = conn_idle.flush();
+    }).unwrap();
+
     Ok(())
 }
