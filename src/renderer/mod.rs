@@ -27,13 +27,14 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 use worker::{spawn_worker, WorkerCommand, WorkerResponse, MonitorJob};
 
 use calloop::generic::Generic;
+use calloop::signals::{Signal, Signals};
 use calloop::{EventLoop, Interest, Mode, PostAction};
 
 pub enum RendererCommand {
     SetWallpaper {
         image: std::path::PathBuf,
         mode: String,
-        monitor: String,
+        monitor: String, // empty string means all monitors
         blur: u32,
     },
     Reload,
@@ -90,6 +91,7 @@ struct State {
     default_image: Option<std::path::PathBuf>,
         monitor_overrides: HashMap<String, (std::path::PathBuf, String)>,
         current_blur: u32,
+        loop_signal: Option<calloop::LoopSignal>,
 }
 
 fn prepare_surface(
@@ -354,7 +356,7 @@ pub fn run(
     initial_mode: String,
     initial_blur: u32,
     initial_overrides: HashMap<String, (std::path::PathBuf, String)>,
-    receiver: calloop::channel::Channel<RendererCommand>,
+           receiver: calloop::channel::Channel<RendererCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Wallman renderer started");
     let conn = Connection::connect_to_env()?;
@@ -375,6 +377,7 @@ pub fn run(
         default_image: Some(image.as_ref().to_path_buf()),
             monitor_overrides: initial_overrides,
             current_blur: initial_blur,
+            loop_signal: None,
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -420,6 +423,9 @@ pub fn run(
     let mut event_loop: EventLoop<State> = EventLoop::try_new().unwrap();
     let handle = event_loop.handle();
     let loop_signal = event_loop.get_signal();
+
+    // Store the loop signal in state so we can stop it from signal handlers
+    state.loop_signal = Some(loop_signal.clone());
 
     // Clone handles for closures
     let qh_worker = qh.clone();
@@ -486,7 +492,27 @@ pub fn run(
         }
     }).unwrap();
 
-    // Use the Connection directly, since it implements AsFd
+    // Register signal handler for graceful shutdown
+    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT]).unwrap();
+    handle.insert_source(signals, move |event, _, state| {
+        let sig = event.signal();
+        eprintln!("Received signal {:?}, shutting down gracefully...", sig);
+
+        // Clean up all Wayland surfaces
+        for monitor in &mut state.monitors {
+            if let Some(ls) = monitor.wallpaper.layer_surface.as_ref() { ls.destroy(); }
+            if let Some(s) = monitor.wallpaper.surface.as_ref() { s.destroy(); }
+            if let Some(ls) = monitor.backdrop.layer_surface.as_ref() { ls.destroy(); }
+            if let Some(s) = monitor.backdrop.surface.as_ref() { s.destroy(); }
+        }
+
+        // Stop the event loop
+        if let Some(signal) = &state.loop_signal {
+            signal.stop();
+        }
+    }).unwrap();
+
+    // Register Wayland connection fd
     let conn_source = conn.clone();
     handle.insert_source(
         Generic::new(conn_source, Interest::READ, Mode::Level),

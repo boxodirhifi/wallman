@@ -21,8 +21,17 @@ impl Daemon {
 
         let cache_dir = project_dirs.cache_dir();
         let cached_wallpaper = cache_dir.join("current.png");
-        let default_mode = self.config.mode.clone();
-        let default_blur = self.config.blur;
+        #[derive(serde::Deserialize)]
+        struct Meta { mode: String, blur: u32 }
+
+        let mut default_mode = self.config.mode.clone();
+        let mut default_blur = self.config.blur;
+        if let Ok(meta_str) = std::fs::read_to_string(cache_dir.join("current.toml")) {
+            if let Ok(meta) = toml::from_str::<Meta>(&meta_str) {
+                default_mode = meta.mode;
+                default_blur = meta.blur;
+            }
+        }
 
         // Scan for per-monitor cached wallpapers
         let mut monitor_overrides: HashMap<String, (std::path::PathBuf, String)> = HashMap::new();
@@ -32,7 +41,16 @@ impl Daemon {
                 if file_name.ends_with(".png") && file_name != "current.png" {
                     let monitor_name = file_name.trim_end_matches(".png").to_string();
                     let path = entry.path();
-                    monitor_overrides.insert(monitor_name, (path, default_mode.clone()));
+
+                    let mut monitor_mode = default_mode.clone();
+                    let meta_path = cache_dir.join(format!("{}.toml", monitor_name));
+                    if let Ok(meta_str) = std::fs::read_to_string(meta_path) {
+                        if let Ok(meta) = toml::from_str::<Meta>(&meta_str) {
+                            monitor_mode = meta.mode;
+                        }
+                    }
+
+                    monitor_overrides.insert(monitor_name, (path, monitor_mode));
                 }
             }
         }

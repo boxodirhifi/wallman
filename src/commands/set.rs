@@ -75,15 +75,29 @@ pub fn run(
              display_monitor
     );
 
-    let ipc_monitor = monitor.unwrap_or_default();
+    let ipc_monitor = monitor.as_deref().unwrap_or_default().to_string();
 
     // Create our strongly-typed JSON command instead of a formatted string
     let command = crate::ipc::Command::Set {
         image: cached_wallpaper.display().to_string(),
-        mode,
+        mode: mode.clone(),
         monitor: ipc_monitor,
         blur,
     };
 
     crate::ipc::send_command(&command);
+    #[derive(serde::Serialize)]
+    struct Meta { mode: String, blur: u32 }
+
+    let metadata = Meta { mode: mode.clone(), blur };
+    let meta_filename = if let Some(ref m) = monitor {
+        format!("{}.toml", m)
+    } else {
+        "current.toml".to_string()
+    };
+
+    let meta_path = cache_dir.join(&meta_filename);
+    if let Err(e) = std::fs::write(&meta_path, toml::to_string(&metadata).unwrap_or_default()) {
+        eprintln!("Failed to write metadata: {e}");
+    }
 }
