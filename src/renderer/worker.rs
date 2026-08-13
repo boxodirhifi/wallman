@@ -83,8 +83,28 @@ fn process_images(
 
     for job in jobs {
         if !decoded_images.contains_key(&job.path) {
+            // Open with ImageReader to check dimensions cheaply
+            let reader = image::ImageReader::open(&job.path)
+            .map_err(|e| format!("failed to open {}: {e}", job.path.display()))?
+            .with_guessed_format()
+            .map_err(|e| format!("failed to guess format {}: {e}", job.path.display()))?;
+
+            let (img_w, img_h) = reader.into_dimensions()
+            .map_err(|e| format!("failed to read dimensions {}: {e}", job.path.display()))?;
+
+            // Safety net: Refuse images larger than 2x monitor resolution
+            let max_dim = job.wp_width.max(job.bd_width).max(job.wp_height).max(job.bd_height) * 2;
+            if img_w > max_dim || img_h > max_dim {
+                return Err(format!(
+                    "Image {} ({}x{}) is too large! Max dimension is {}x{}. Please resize it first.",
+                                   job.path.display(), img_w, img_h, max_dim, max_dim
+                ).into());
+            }
+
+            // If safe, decode the full image
             let img = image::open(&job.path)
-            .map_err(|e| format!("failed to open {}: {e}", job.path.display()))?;
+            .map_err(|e| format!("failed to decode {}: {e}", job.path.display()))?;
+
             decoded_images.insert(job.path.clone(), img);
         }
     }
