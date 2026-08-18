@@ -89,9 +89,9 @@ struct State {
     monitor_names: HashMap<ObjectId, String>,
     current_mode: String,
     default_image: Option<std::path::PathBuf>,
-        monitor_overrides: HashMap<String, (std::path::PathBuf, String)>,
-        current_blur: u32,
-        loop_signal: Option<calloop::LoopSignal>,
+    monitor_overrides: HashMap<String, (std::path::PathBuf, String)>,
+    current_blur: u32,
+    loop_signal: Option<calloop::LoopSignal>,
 }
 
 fn prepare_surface(
