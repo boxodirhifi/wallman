@@ -550,8 +550,8 @@ pub fn run(
                              if let Some(read_guard) = event_queue.prepare_read() {
                                  if let Err(e) = read_guard.read() {
                                      eprintln!("Wayland read error: {e}");
-                                     signal_wl.stop();
-                                     return Ok(PostAction::Continue);
+                                     eprintln!("Wayland connection lost, exiting daemon.");
+                                     std::process::exit(0);
                                  }
                              }
 

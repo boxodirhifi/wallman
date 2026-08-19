@@ -79,6 +79,44 @@ impl Daemon {
 
         println!("wallman daemon started");
 
+        // --- RESTORE WALLPAPER ON STARTUP ---
+        let restore_sender = renderer_sender.clone();
+        std::thread::spawn(move || {
+            // Brief wait for renderer to create surfaces
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            let saved = crate::state::load();
+
+            if let Some(ref image) = saved.default_image {
+                if image.exists() {
+                    let mode = saved.default_mode.clone().unwrap_or_else(|| "fill".to_string());
+                    let blur = saved.default_blur.unwrap_or(8);
+                    restore_sender
+                    .send(crate::renderer::RendererCommand::SetWallpaper {
+                        image: image.clone(),
+                          mode,
+                          monitor: String::new(),
+                          blur,
+                    })
+                    .ok();
+                }
+            }
+
+            for o in &saved.monitor_overrides {
+                if o.image.exists() {
+                    restore_sender
+                    .send(crate::renderer::RendererCommand::SetWallpaper {
+                        image: o.image.clone(),
+                          mode: o.mode.clone(),
+                          monitor: o.monitor.clone(),
+                          blur: o.blur,
+                    })
+                    .ok();
+                }
+            }
+        });
+        // --- END RESTORE ---
+
         ipc::serve(listener, move |command| {
             println!("Daemon received: {:?}", command);
 
@@ -106,5 +144,6 @@ impl Daemon {
                 }
             }
         });
+
     }
 }

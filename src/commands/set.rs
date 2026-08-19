@@ -1,5 +1,6 @@
 use directories::ProjectDirs;
 use std::{fs, path::PathBuf};
+use image::GenericImageView;
 
 pub fn run(
     image: PathBuf,
@@ -47,6 +48,16 @@ pub fn run(
         std::process::exit(1);
     });
 
+    // Resize if exceeds max dimension before caching
+    let max_dim = 3840u32;
+    let (w, h) = decoded.dimensions();
+    let decoded = if w > max_dim || h > max_dim {
+        println!("Resizing source image to fit within {}x{} max dimension", max_dim, max_dim);
+        decoded.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
+    } else {
+        decoded
+    };
+
     decoded.save_with_format(
         &temporary_wallpaper,
         image::ImageFormat::Png,
@@ -81,7 +92,7 @@ pub fn run(
     let command = crate::ipc::Command::Set {
         image: cached_wallpaper.display().to_string(),
         mode: mode.clone(),
-        monitor: ipc_monitor,
+        monitor: ipc_monitor.clone(),
         blur,
     };
 
@@ -100,4 +111,21 @@ pub fn run(
     if let Err(e) = std::fs::write(&meta_path, toml::to_string(&metadata).unwrap_or_default()) {
         eprintln!("Failed to write metadata: {e}");
     }
+    // Persist state for next login
+    let mut state = crate::state::load();
+    if ipc_monitor.is_empty() {
+        state.default_image = Some(cached_wallpaper.clone());
+        state.default_mode = Some(mode.clone());
+        state.default_blur = Some(blur);
+    } else {
+        // Remove existing override for this monitor if any
+        state.monitor_overrides.retain(|o| o.monitor != ipc_monitor);
+        state.monitor_overrides.push(crate::state::MonitorOverride {
+            monitor: ipc_monitor.clone(),
+                                     image: cached_wallpaper.clone(),
+                                     mode: mode.clone(),
+                                     blur,
+        });
+    }
+    crate::state::save(&state);
 }
