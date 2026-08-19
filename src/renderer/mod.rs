@@ -3,6 +3,7 @@ mod worker;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
+use std::io::Write;
 
 use wayland_client::{
     backend::ObjectId,
@@ -89,9 +90,10 @@ struct State {
     monitor_names: HashMap<ObjectId, String>,
     current_mode: String,
     default_image: Option<std::path::PathBuf>,
-    monitor_overrides: HashMap<String, (std::path::PathBuf, String)>,
-    current_blur: u32,
-    loop_signal: Option<calloop::LoopSignal>,
+        monitor_overrides: HashMap<String, (std::path::PathBuf, String)>,
+        current_blur: u32,
+        loop_signal: Option<calloop::LoopSignal>,
+        per_monitor_blur: HashMap<String, u32>,
 }
 
 fn prepare_surface(
@@ -324,6 +326,7 @@ fn setup_pending_outputs(
         });
     }
 
+    // Initial commit to trigger configure events from the compositor
     for monitor in &state.monitors {
         if monitor.wallpaper.configure_serial.is_none() {
             if let Some(s) = monitor.wallpaper.surface.as_ref() { s.commit(); }
@@ -348,6 +351,38 @@ fn setup_pending_outputs(
         }
     }
 
+    // Solid color fallback AFTER we know the dimensions (so it doesn't flash empty)
+    // Solid color fallback AFTER we know the dimensions (so it doesn't flash empty)
+    let shm = state.shm.as_ref().ok_or("wl_shm not bound")?.clone();
+    for monitor in &mut state.monitors {
+        if monitor.wallpaper.buffer.is_none() {
+            let w = monitor.wallpaper.width;
+            let h = monitor.wallpaper.height;
+            let size = (w as usize) * (h as usize) * 4;
+            if size > 0 {
+                if let Ok(mut memfd) = worker::create_shm_file("wallman-solid", size) {
+                    let buf = vec![0u8; size]; // solid black
+                    if memfd.write_all(&buf).is_ok() {
+                        let _ = prepare_surface(&mut monitor.wallpaper, &shm, qh, memfd, w, h);
+                    }
+                }
+            }
+        }
+        if monitor.backdrop.buffer.is_none() {
+            let w = monitor.backdrop.width;
+            let h = monitor.backdrop.height;
+            let size = (w as usize) * (h as usize) * 4;
+            if size > 0 {
+                if let Ok(mut memfd) = worker::create_shm_file("wallman-solid", size) {
+                    let buf = vec![0u8; size]; // solid black
+                    if memfd.write_all(&buf).is_ok() {
+                        let _ = prepare_surface(&mut monitor.backdrop, &shm, qh, memfd, w, h);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(true)
 }
 
@@ -355,6 +390,7 @@ pub fn run(
     image: impl AsRef<std::path::Path>,
     initial_mode: String,
     initial_blur: u32,
+    initial_per_monitor_blur: HashMap<String, u32>,
     initial_overrides: HashMap<String, (std::path::PathBuf, String)>,
            receiver: calloop::channel::Channel<RendererCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -378,6 +414,7 @@ pub fn run(
             monitor_overrides: initial_overrides,
             current_blur: initial_blur,
             loop_signal: None,
+            per_monitor_blur: initial_per_monitor_blur,
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -395,13 +432,16 @@ pub fn run(
     .map(|d| d.cache_dir().to_path_buf());
 
     let shm = state.shm.as_ref().ok_or("wl_shm not bound")?.clone();
-    let mut cache_loaded = false;
+    let mut cache_hits = 0;
+    let total_monitors = state.monitors.len();
 
     if let Some(ref dir) = cache_dir {
         for monitor in &mut state.monitors {
             // Get current settings for this monitor
             let (mode, blur) = if let Some((_, m)) = state.monitor_overrides.get(&monitor.name) {
-                (m.clone(), state.current_blur)
+                // Use per-monitor blur from state if available
+                let monitor_blur = state.per_monitor_blur.get(&monitor.name).copied().unwrap_or(state.current_blur);
+                (m.clone(), monitor_blur)
             } else {
                 (state.current_mode.clone(), state.current_blur)
             };
@@ -411,16 +451,17 @@ pub fn run(
             let bd_width = monitor.backdrop.width;
             let bd_height = monitor.backdrop.height;
 
+            let mut wp_loaded = false;
+            let mut bd_loaded = false;
+
             // Try to load wallpaper from raw cache
             if let Some((wp_pixels, w, h)) = crate::cache::try_load_raw_cache(
                 dir, &monitor.name, "wp", wp_width, wp_height, blur, &mode
             ) {
                 if let Ok(mut memfd) = worker::create_shm_file("wallman-wp-cache", wp_pixels.len()) {
-                    use std::io::Write;
                     if memfd.write_all(&wp_pixels).is_ok() {
                         if prepare_surface(&mut monitor.wallpaper, &shm, &qh, memfd, w, h).is_ok() {
-                            println!("[{}] loaded cached wallpaper instantly", monitor.name);
-                            cache_loaded = true;
+                            wp_loaded = true;
                         }
                     }
                 }
@@ -431,44 +472,54 @@ pub fn run(
                 dir, &monitor.name, "bd", bd_width, bd_height, blur, &mode
             ) {
                 if let Ok(mut memfd) = worker::create_shm_file("wallman-bd-cache", bd_pixels.len()) {
-                    use std::io::Write;
                     if memfd.write_all(&bd_pixels).is_ok() {
                         if prepare_surface(&mut monitor.backdrop, &shm, &qh, memfd, w, h).is_ok() {
-                            println!("[{}] loaded cached backdrop instantly", monitor.name);
+                            bd_loaded = true;
                         }
                     }
                 }
             }
+
+            if wp_loaded && bd_loaded {
+                cache_hits += 1;
+                println!("[{}] loaded cached wallpaper & backdrop instantly", monitor.name);
+            }
         }
     }
 
-    if !cache_loaded {
-        println!("[renderer] no cache found, worker will process images");
+    let all_cached = cache_hits == total_monitors && total_monitors > 0;
+
+    if all_cached {
+        println!("[renderer] all monitors loaded from cache, skipping initial worker pass");
+    } else {
+        println!("[renderer] cache miss, worker will process images");
     }
     // === END CACHE LOADING ===
 
     let (worker_tx, worker_rx) = spawn_worker();
 
-    let jobs = build_jobs(&state);
-    worker_tx.send(WorkerCommand::Process { jobs }).expect("worker thread crashed");
+    if !all_cached {
+        let jobs = build_jobs(&state);
+        worker_tx.send(WorkerCommand::Process { jobs }).expect("worker thread crashed");
 
-    match worker_rx.recv().expect("worker thread crashed") {
-        WorkerResponse::Ready { colors, monitors: results } => {
-            write_colors_file(&colors);
-            for result in results {
-                if let Some(monitor) = state.monitors.iter_mut().find(|m| m.name == result.name) {
-                    if let Err(e) = prepare_surface(&mut monitor.wallpaper, &shm, &qh, result.wallpaper_file, result.wp_width, result.wp_height) {
-                        eprintln!("wp prep failed: {e}");
-                    }
-                    if let Err(e) = prepare_surface(&mut monitor.backdrop, &shm, &qh, result.backdrop_file, result.bd_width, result.bd_height) {
-                        eprintln!("bd prep failed: {e}");
+        match worker_rx.recv().expect("worker thread crashed") {
+            WorkerResponse::Ready { colors, monitors: results } => {
+                write_colors_file(&colors);
+                for result in results {
+                    if let Some(monitor) = state.monitors.iter_mut().find(|m| m.name == result.name) {
+                        if let Err(e) = prepare_surface(&mut monitor.wallpaper, &shm, &qh, result.wallpaper_file, result.wp_width, result.wp_height) {
+                            eprintln!("wp prep failed: {e}");
+                        }
+                        if let Err(e) = prepare_surface(&mut monitor.backdrop, &shm, &qh, result.backdrop_file, result.bd_width, result.bd_height) {
+                            eprintln!("bd prep failed: {e}");
+                        }
                     }
                 }
+                println!("initial wallpapers loaded");
             }
-            println!("initial wallpapers loaded");
-        }
-        WorkerResponse::Failed(e) => {
-            eprintln!("Failed to process initial wallpapers: {}", e);
+            WorkerResponse::Failed(e) => {
+                eprintln!("Failed to process initial wallpapers: {}", e);
+            }
         }
     }
 
@@ -507,9 +558,12 @@ pub fn run(
                     if monitor.is_empty() {
                         state.default_image = Some(image.clone());
                         state.current_mode = mode.clone();
+                        state.current_blur = blur;
                         state.monitor_overrides.clear();
+                        state.per_monitor_blur.clear();
                     } else {
                         state.monitor_overrides.insert(monitor.clone(), (image.clone(), mode.clone()));
+                        state.per_monitor_blur.insert(monitor.clone(), blur);
                     }
                     let jobs = build_jobs(state);
                     if !jobs.is_empty() {

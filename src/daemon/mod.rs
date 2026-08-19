@@ -71,6 +71,7 @@ impl Daemon {
                 renderer_image,
                 renderer_mode,
                 default_blur,
+                std::collections::HashMap::new(),
                 monitor_overrides,
                 renderer_receiver,
             )
