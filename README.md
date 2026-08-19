@@ -23,7 +23,7 @@ Wallman was designed specifically to solve the "Overview Backdrop" problem in co
 Currently installable via Cargo:
 
 ```bash
-cargo install --git https://github.com/boxodirhifi/wallman.git
+cargo install --git https://github.com/boxodirhifi/wallman.git --tag v1.2.0
 ```
 
 *(Ensure your Cargo `bin` directory is in your `$PATH`)*
@@ -114,7 +114,8 @@ You can use a simple script in your compositor config to reload your tools (like
 
 * [x] Configurable blur radius
 * [x] Monitor hotplugging support
-* [ ] Additional image-processing options
+* [x] Persistent state across logout/login
+* [x] Zero-flash startup via raw buffer caching
 * [x] Further performance optimizations (0% CPU idle via `calloop`)
 * [x] More advanced per-monitor configuration (persistent modes & blur)
 * [ ] Additional theming integrations
