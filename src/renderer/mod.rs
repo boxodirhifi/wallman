@@ -390,8 +390,64 @@ pub fn run(
     setup_pending_outputs(&mut state, &mut event_queue, &qh)?;
     println!("created surfaces for {} monitor(s)", state.monitors.len());
 
-    let (worker_tx, worker_rx) = spawn_worker();
+    // === INSTANT CACHE LOADING ===
+    let cache_dir = directories::ProjectDirs::from("", "", "wallman")
+    .map(|d| d.cache_dir().to_path_buf());
+
     let shm = state.shm.as_ref().ok_or("wl_shm not bound")?.clone();
+    let mut cache_loaded = false;
+
+    if let Some(ref dir) = cache_dir {
+        for monitor in &mut state.monitors {
+            // Get current settings for this monitor
+            let (mode, blur) = if let Some((_, m)) = state.monitor_overrides.get(&monitor.name) {
+                (m.clone(), state.current_blur)
+            } else {
+                (state.current_mode.clone(), state.current_blur)
+            };
+
+            let wp_width = monitor.wallpaper.width;
+            let wp_height = monitor.wallpaper.height;
+            let bd_width = monitor.backdrop.width;
+            let bd_height = monitor.backdrop.height;
+
+            // Try to load wallpaper from raw cache
+            if let Some((wp_pixels, w, h)) = crate::cache::try_load_raw_cache(
+                dir, &monitor.name, "wp", wp_width, wp_height, blur, &mode
+            ) {
+                if let Ok(mut memfd) = worker::create_shm_file("wallman-wp-cache", wp_pixels.len()) {
+                    use std::io::Write;
+                    if memfd.write_all(&wp_pixels).is_ok() {
+                        if prepare_surface(&mut monitor.wallpaper, &shm, &qh, memfd, w, h).is_ok() {
+                            println!("[{}] loaded cached wallpaper instantly", monitor.name);
+                            cache_loaded = true;
+                        }
+                    }
+                }
+            }
+
+            // Try to load backdrop from raw cache
+            if let Some((bd_pixels, w, h)) = crate::cache::try_load_raw_cache(
+                dir, &monitor.name, "bd", bd_width, bd_height, blur, &mode
+            ) {
+                if let Ok(mut memfd) = worker::create_shm_file("wallman-bd-cache", bd_pixels.len()) {
+                    use std::io::Write;
+                    if memfd.write_all(&bd_pixels).is_ok() {
+                        if prepare_surface(&mut monitor.backdrop, &shm, &qh, memfd, w, h).is_ok() {
+                            println!("[{}] loaded cached backdrop instantly", monitor.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !cache_loaded {
+        println!("[renderer] no cache found, worker will process images");
+    }
+    // === END CACHE LOADING ===
+
+    let (worker_tx, worker_rx) = spawn_worker();
 
     let jobs = build_jobs(&state);
     worker_tx.send(WorkerCommand::Process { jobs }).expect("worker thread crashed");

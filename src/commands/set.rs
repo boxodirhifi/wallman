@@ -78,6 +78,26 @@ pub fn run(
         std::process::exit(1);
     });
 
+    // If setting a global wallpaper, clean up stale per-monitor caches
+    if monitor.is_none() {
+        if let Ok(entries) = fs::read_dir(cache_dir) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
+
+                // Skip global files
+                if file_name_str.starts_with("current.") || file_name_str == "colors.toml" || file_name_str == "state.json" {
+                    continue;
+                }
+
+                // Delete per-monitor cache files
+                if file_name_str.ends_with(".png") || file_name_str.ends_with(".toml") || file_name_str.ends_with(".raw") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     let display_monitor = monitor.as_deref().unwrap_or("all monitors");
     println!(
         "Cached wallpaper: {} → {} (Target: {})",

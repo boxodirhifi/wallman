@@ -8,6 +8,11 @@ use std::thread;
 use std::collections::HashMap;
 use image::GenericImageView;
 
+fn get_cache_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "wallman")
+    .map(|d| d.cache_dir().to_path_buf())
+}
+
 #[derive(Clone)]
 pub struct MonitorJob {
     pub name: String,
@@ -199,6 +204,30 @@ fn process_images(
 
         let bd_pixels = rgba_to_xrgb(&blurred_rgba);
 
+        // Write raw cache for instant startup
+        if let Some(ref cache_dir) = get_cache_dir() {
+            let _ = crate::cache::write_raw_cache(
+                cache_dir,
+                &job.name,
+                "wp",
+                job.wp_width,
+                job.wp_height,
+                job.blur,
+                &job.mode,
+                &wp_pixels,
+            );
+            let _ = crate::cache::write_raw_cache(
+                cache_dir,
+                &job.name,
+                "bd",
+                job.bd_width,
+                job.bd_height,
+                job.blur,
+                &job.mode,
+                &bd_pixels,
+            );
+        }
+
         let mut wp_file = create_shm_file("wallman-wallpaper", wp_pixels.len())?;
         wp_file.write_all(&wp_pixels)?;
         wp_file.flush()?;
@@ -254,7 +283,7 @@ fn rgba_to_xrgb(rgba: &image::RgbaImage) -> Vec<u8> {
     pixels
 }
 
-fn create_shm_file(name: &str, size: usize) -> Result<File, Box<dyn std::error::Error>> {
+pub fn create_shm_file(name: &str, size: usize) -> Result<File, Box<dyn std::error::Error>> {
     let cname = CString::new(name)?;
     let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {

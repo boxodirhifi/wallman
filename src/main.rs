@@ -5,6 +5,7 @@ mod ipc;
 mod config;
 mod renderer;
 mod state;
+mod cache;
 
 use clap::Parser;
 use cli::{Cli, Commands, ConfigCommands, ConfigSetCommands};
