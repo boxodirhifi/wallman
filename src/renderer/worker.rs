@@ -102,7 +102,7 @@ fn process_images(
             if img_w > max_dim || img_h > max_dim {
                 return Err(format!(
                     "Image {} ({}x{}) is too large! Max dimension is {}x{}. Please resize it first.",
-                                   job.path.display(), img_w, img_h, max_dim, max_dim
+                        job.path.display(), img_w, img_h, max_dim, max_dim
                 ).into());
             }
 
