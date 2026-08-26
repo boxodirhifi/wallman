@@ -12,7 +12,7 @@ pub struct RawHeader {
     height: u32,
     stride: u32,
     blur: u32,
-    mode: [u8; 16], // Store mode as fixed-size string
+    mode: [u8; 16],
 }
 
 impl RawHeader {
@@ -39,10 +39,35 @@ impl RawHeader {
         mode_bytes[..len].copy_from_slice(&mode_str[..len]);
 
         self.magic == *MAGIC
-        && self.width == width
-        && self.height == height
-        && self.blur == blur
-        && self.mode == mode_bytes
+            && self.width == width
+            && self.height == height
+            && self.blur == blur
+            && self.mode == mode_bytes
+    }
+
+    pub fn to_bytes(&self) -> [u8; 40] {
+        let mut bytes = [0u8; 40];
+        bytes[0..8].copy_from_slice(&self.magic);
+        bytes[8..12].copy_from_slice(&self.width.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&self.height.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&self.stride.to_ne_bytes());
+        bytes[20..24].copy_from_slice(&self.blur.to_ne_bytes());
+        bytes[24..40].copy_from_slice(&self.mode);
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 40 { return None; }
+        let mut magic = [0u8; 8];
+        magic.copy_from_slice(&bytes[0..8]);
+        let width = u32::from_ne_bytes(bytes[8..12].try_into().ok()?);
+        let height = u32::from_ne_bytes(bytes[12..16].try_into().ok()?);
+        let stride = u32::from_ne_bytes(bytes[16..20].try_into().ok()?);
+        let blur = u32::from_ne_bytes(bytes[20..24].try_into().ok()?);
+        let mut mode = [0u8; 16];
+        mode.copy_from_slice(&bytes[24..40]);
+
+        Some(Self { magic, width, height, stride, blur, mode })
     }
 }
 
@@ -67,14 +92,9 @@ pub fn write_raw_cache(
 
     let mut f = File::create(&tmp)?;
     let header = RawHeader::new(width, height, blur, mode);
-
-    let header_bytes = unsafe {
-        std::slice::from_raw_parts(
-            &header as *const _ as *const u8,
-            std::mem::size_of::<RawHeader>(),
-        )
-    };
-    f.write_all(header_bytes)?;
+    let header_bytes = header.to_bytes();
+    f.write_all(&header_bytes)?;
+    f.write_all(&header_bytes)?;
     f.write_all(pixels)?;
     f.sync_all()?;
     fs::rename(tmp, path)?;
@@ -95,10 +115,13 @@ pub fn try_load_raw_cache(
 ) -> Option<(Vec<u8>, u32, u32)> {
     let path = raw_path(cache_dir, monitor, kind);
     let mut f = File::open(&path).ok()?;
-    let mut header_buf = [0u8; std::mem::size_of::<RawHeader>()];
+    let mut header_buf = [0u8; 40];
     f.read_exact(&mut header_buf).ok()?;
 
-    let header: RawHeader = unsafe { std::ptr::read(header_buf.as_ptr() as *const _) };
+    let header = match RawHeader::from_bytes(&header_buf) {
+        Some(h) => h,
+        None => return None,
+    };
 
     if !header.matches(expected_w, expected_h, expected_blur, expected_mode) {
         return None;

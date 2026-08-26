@@ -14,6 +14,13 @@ pub fn run(
 
     let blur = blur.unwrap_or(config.blur);
 
+    if let Some(ref m) = monitor {
+            let is_valid = m.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if !is_valid {
+                eprintln!("Error: invalid monitor name '{}'. Only letters, numbers, hyphens, and underscores are allowed.", m);
+                std::process::exit(1);
+            }
+        }
 
     if !image.exists() {
         eprintln!("Error: '{}' does not exist.", image.display());
