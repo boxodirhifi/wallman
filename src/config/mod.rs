@@ -33,8 +33,17 @@ pub fn load() -> Config {
             blur: default_blur(),
         };
     }
-    let content = fs::read_to_string(&path).expect("Failed to read config");
-    toml::from_str(&content).expect("Failed to parse config")
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Warning: Failed to read config.toml ({e}). Using defaults.");
+            return Config { mode: default_mode(), blur: default_blur() };
+        }
+    };
+    toml::from_str(&content).unwrap_or_else(|e| {
+        eprintln!("Warning: Failed to parse config.toml ({e}). Using defaults.");
+        Config { mode: default_mode(), blur: default_blur() }
+    })
 }
 
 pub fn save(config: &Config) {

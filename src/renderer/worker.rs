@@ -199,7 +199,7 @@ fn process_images(
             &small_blurred,
             job.bd_width,
             job.bd_height,
-            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::Triangle,
         );
 
         let bd_pixels = rgba_to_xrgb(&blurred_rgba);

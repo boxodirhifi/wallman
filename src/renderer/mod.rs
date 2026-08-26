@@ -48,7 +48,7 @@ struct SurfaceState {
     pool: Option<WlShmPool>,
     buffer: Option<WlBuffer>,
     file: Option<File>,
-    old_buffers: Vec<WlBuffer>,
+    old_buffers: Vec<(WlBuffer, WlShmPool, File)>,
     configure_serial: Option<u32>,
     width: u32,
     height: u32,
@@ -122,8 +122,12 @@ fn prepare_surface(
         return Err("wl_surface not created".into());
     }
 
-    if let Some(old_buffer) = ss.buffer.take() {
-        ss.old_buffers.push(old_buffer);
+    let old_buffer = ss.buffer.take();
+    let old_pool = ss.pool.take();
+    let old_file = ss.file.take();
+
+    if let (Some(ob), Some(op), Some(of)) = (old_buffer, old_pool, old_file) {
+        ss.old_buffers.push((ob, op, of));
     }
 
     ss.pool = Some(pool);
@@ -220,8 +224,8 @@ impl Dispatch<WlBuffer, ()> for State {
     fn event(state: &mut State, buffer: &WlBuffer, event: wl_buffer::Event, _d: &(), _c: &Connection, _q: &QueueHandle<Self>) {
         if let wl_buffer::Event::Release = event {
             for monitor in &mut state.monitors {
-                monitor.wallpaper.old_buffers.retain(|b| b.id() != buffer.id());
-                monitor.backdrop.old_buffers.retain(|b| b.id() != buffer.id());
+                monitor.wallpaper.old_buffers.retain(|(b, _, _)| b.id() != buffer.id());
+                monitor.backdrop.old_buffers.retain(|(b, _, _)| b.id() != buffer.id());
             }
         }
     }
@@ -360,11 +364,9 @@ fn setup_pending_outputs(
             let h = monitor.wallpaper.height;
             let size = (w as usize) * (h as usize) * 4;
             if size > 0 {
-                if let Ok(mut memfd) = worker::create_shm_file("wallman-solid", size) {
-                    let buf = vec![0u8; size]; // solid black
-                    if memfd.write_all(&buf).is_ok() {
-                        let _ = prepare_surface(&mut monitor.wallpaper, &shm, qh, memfd, w, h);
-                    }
+                // memfd is already zero-filled by set_len() in create_shm_file
+                if let Ok(memfd) = worker::create_shm_file("wallman-solid", size) {
+                    let _ = prepare_surface(&mut monitor.wallpaper, &shm, qh, memfd, w, h);
                 }
             }
         }
@@ -373,11 +375,9 @@ fn setup_pending_outputs(
             let h = monitor.backdrop.height;
             let size = (w as usize) * (h as usize) * 4;
             if size > 0 {
-                if let Ok(mut memfd) = worker::create_shm_file("wallman-solid", size) {
-                    let buf = vec![0u8; size]; // solid black
-                    if memfd.write_all(&buf).is_ok() {
-                        let _ = prepare_surface(&mut monitor.backdrop, &shm, qh, memfd, w, h);
-                    }
+                // memfd is already zero-filled by set_len() in create_shm_file
+                if let Ok(memfd) = worker::create_shm_file("wallman-solid", size) {
+                    let _ = prepare_surface(&mut monitor.backdrop, &shm, qh, memfd, w, h);
                 }
             }
         }
