@@ -269,11 +269,14 @@ fn build_jobs(state: &State) -> Vec<MonitorJob> {
             return None;
         };
 
+        // Use per-monitor blur if available, otherwise fall back to global current_blur
+        let job_blur = state.per_monitor_blur.get(&m.name).copied().unwrap_or(state.current_blur);
+
         Some(MonitorJob {
             name: m.name.clone(),
              path,
              mode,
-             blur: state.current_blur,
+             blur: job_blur,
              wp_width: m.wallpaper.width,
              wp_height: m.wallpaper.height,
              bd_width: m.backdrop.width,
@@ -554,14 +557,15 @@ pub fn run(
                     }
                 }
                 RendererCommand::SetWallpaper { image, mode, monitor, blur } => {
-                    state.current_blur = blur;
                     if monitor.is_empty() {
+                        // Global set: update global blur and clear overrides
                         state.default_image = Some(image.clone());
                         state.current_mode = mode.clone();
                         state.current_blur = blur;
                         state.monitor_overrides.clear();
                         state.per_monitor_blur.clear();
                     } else {
+                        // Per-monitor set: DO NOT touch current_blur, only update the map
                         state.monitor_overrides.insert(monitor.clone(), (image.clone(), mode.clone()));
                         state.per_monitor_blur.insert(monitor.clone(), blur);
                     }

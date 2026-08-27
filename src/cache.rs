@@ -94,7 +94,6 @@ pub fn write_raw_cache(
     let header = RawHeader::new(width, height, blur, mode);
     let header_bytes = header.to_bytes();
     f.write_all(&header_bytes)?;
-    f.write_all(&header_bytes)?;
     f.write_all(pixels)?;
     f.sync_all()?;
     fs::rename(tmp, path)?;
