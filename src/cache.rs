@@ -60,12 +60,20 @@ impl RawHeader {
         if bytes.len() < 40 { return None; }
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&bytes[0..8]);
+
+        // Validate magic bytes immediately
+        if magic != *MAGIC { return None; }
+
         let width = u32::from_ne_bytes(bytes[8..12].try_into().ok()?);
         let height = u32::from_ne_bytes(bytes[12..16].try_into().ok()?);
         let stride = u32::from_ne_bytes(bytes[16..20].try_into().ok()?);
         let blur = u32::from_ne_bytes(bytes[20..24].try_into().ok()?);
         let mut mode = [0u8; 16];
         mode.copy_from_slice(&bytes[24..40]);
+
+        // Validate stride and cap max resolution to 16K to prevent massive allocations
+        if stride != width.checked_mul(4)? { return None; }
+        if width > 16384 || height > 16384 { return None; }
 
         Some(Self { magic, width, height, stride, blur, mode })
     }

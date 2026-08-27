@@ -53,6 +53,7 @@ struct SurfaceState {
     width: u32,
     height: u32,
     closed: bool,
+    needs_rerender: bool,
 }
 
 impl SurfaceState {
@@ -69,6 +70,7 @@ impl SurfaceState {
             width: 0,
             height: 0,
             closed: false,
+            needs_rerender: false,
         }
     }
 }
@@ -90,10 +92,11 @@ struct State {
     monitor_names: HashMap<ObjectId, String>,
     current_mode: String,
     default_image: Option<std::path::PathBuf>,
-        monitor_overrides: HashMap<String, (std::path::PathBuf, String)>,
-        current_blur: u32,
-        loop_signal: Option<calloop::LoopSignal>,
-        per_monitor_blur: HashMap<String, u32>,
+    monitor_overrides: HashMap<String, (std::path::PathBuf, String)>,
+    current_blur: u32,
+    loop_signal: Option<calloop::LoopSignal>,
+    per_monitor_blur: HashMap<String, u32>,
+    worker_tx: Option<std::sync::mpsc::Sender<WorkerCommand>>,
 }
 
 fn prepare_surface(
@@ -242,10 +245,12 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
             if let Some(ss) = ss {
                 match event {
                     zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
-                        println!("[{}] configure: serial={serial} width={width} height={height}", ss.namespace);
+                        if ss.width != width || ss.height != height {
+                            ss.width = width;
+                            ss.height = height;
+                            ss.needs_rerender = true;
+                        }
                         ss.configure_serial = Some(serial);
-                        ss.width = width;
-                        ss.height = height;
                     }
                     zwlr_layer_surface_v1::Event::Closed => {
                         println!("[{}] layer surface closed", ss.namespace);
@@ -269,7 +274,6 @@ fn build_jobs(state: &State) -> Vec<MonitorJob> {
             return None;
         };
 
-        // Use per-monitor blur if available, otherwise fall back to global current_blur
         let job_blur = state.per_monitor_blur.get(&m.name).copied().unwrap_or(state.current_blur);
 
         Some(MonitorJob {
@@ -333,7 +337,6 @@ fn setup_pending_outputs(
         });
     }
 
-    // Initial commit to trigger configure events from the compositor
     for monitor in &state.monitors {
         if monitor.wallpaper.configure_serial.is_none() {
             if let Some(s) = monitor.wallpaper.surface.as_ref() { s.commit(); }
@@ -358,8 +361,6 @@ fn setup_pending_outputs(
         }
     }
 
-    // Solid color fallback AFTER we know the dimensions (so it doesn't flash empty)
-    // Solid color fallback AFTER we know the dimensions (so it doesn't flash empty)
     let shm = state.shm.as_ref().ok_or("wl_shm not bound")?.clone();
     for monitor in &mut state.monitors {
         if monitor.wallpaper.buffer.is_none() {
@@ -367,7 +368,6 @@ fn setup_pending_outputs(
             let h = monitor.wallpaper.height;
             let size = (w as usize) * (h as usize) * 4;
             if size > 0 {
-                // memfd is already zero-filled by set_len() in create_shm_file
                 if let Ok(memfd) = worker::create_shm_file("wallman-solid", size) {
                     let _ = prepare_surface(&mut monitor.wallpaper, &shm, qh, memfd, w, h);
                 }
@@ -378,7 +378,6 @@ fn setup_pending_outputs(
             let h = monitor.backdrop.height;
             let size = (w as usize) * (h as usize) * 4;
             if size > 0 {
-                // memfd is already zero-filled by set_len() in create_shm_file
                 if let Ok(memfd) = worker::create_shm_file("wallman-solid", size) {
                     let _ = prepare_surface(&mut monitor.backdrop, &shm, qh, memfd, w, h);
                 }
@@ -414,10 +413,11 @@ pub fn run(
         monitor_names: HashMap::new(),
         current_mode: initial_mode.clone(),
         default_image: Some(image.as_ref().to_path_buf()),
-            monitor_overrides: initial_overrides,
-            current_blur: initial_blur,
-            loop_signal: None,
-            per_monitor_blur: initial_per_monitor_blur,
+        monitor_overrides: initial_overrides,
+        current_blur: initial_blur,
+        loop_signal: None,
+        per_monitor_blur: initial_per_monitor_blur,
+        worker_tx: None,
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -430,7 +430,6 @@ pub fn run(
     setup_pending_outputs(&mut state, &mut event_queue, &qh)?;
     println!("created surfaces for {} monitor(s)", state.monitors.len());
 
-    // === INSTANT CACHE LOADING ===
     let cache_dir = directories::ProjectDirs::from("", "", "wallman")
     .map(|d| d.cache_dir().to_path_buf());
 
@@ -440,9 +439,7 @@ pub fn run(
 
     if let Some(ref dir) = cache_dir {
         for monitor in &mut state.monitors {
-            // Get current settings for this monitor
             let (mode, blur) = if let Some((_, m)) = state.monitor_overrides.get(&monitor.name) {
-                // Use per-monitor blur from state if available
                 let monitor_blur = state.per_monitor_blur.get(&monitor.name).copied().unwrap_or(state.current_blur);
                 (m.clone(), monitor_blur)
             } else {
@@ -457,7 +454,6 @@ pub fn run(
             let mut wp_loaded = false;
             let mut bd_loaded = false;
 
-            // Try to load wallpaper from raw cache
             if let Some((wp_pixels, w, h)) = crate::cache::try_load_raw_cache(
                 dir, &monitor.name, "wp", wp_width, wp_height, blur, &mode
             ) {
@@ -470,7 +466,6 @@ pub fn run(
                 }
             }
 
-            // Try to load backdrop from raw cache
             if let Some((bd_pixels, w, h)) = crate::cache::try_load_raw_cache(
                 dir, &monitor.name, "bd", bd_width, bd_height, blur, &mode
             ) {
@@ -497,9 +492,9 @@ pub fn run(
     } else {
         println!("[renderer] cache miss, worker will process images");
     }
-    // === END CACHE LOADING ===
 
     let (worker_tx, worker_rx) = spawn_worker();
+    state.worker_tx = Some(worker_tx.clone());
 
     if !all_cached {
         let jobs = build_jobs(&state);
@@ -529,15 +524,12 @@ pub fn run(
     event_queue.roundtrip(&mut state)?;
     println!("Wallman renderer is running (multi-monitor)");
 
-    // --- calloop event loop replaces the manual poll loop ---
     let mut event_loop: EventLoop<State> = EventLoop::try_new().unwrap();
     let handle = event_loop.handle();
     let loop_signal = event_loop.get_signal();
 
-    // Store the loop signal in state so we can stop it from signal handlers
     state.loop_signal = Some(loop_signal.clone());
 
-    // Clone handles for closures
     let qh_worker = qh.clone();
     let shm_worker = shm.clone();
     let worker_tx_ipc = worker_tx.clone();
@@ -546,7 +538,6 @@ pub fn run(
     let signal_wl = loop_signal.clone();
     let conn_idle = conn.clone();
 
-    // Register IPC command channel
     handle.insert_source(receiver, move |event, _, state| {
         if let calloop::channel::Event::Msg(command) = event {
             match command {
@@ -558,14 +549,12 @@ pub fn run(
                 }
                 RendererCommand::SetWallpaper { image, mode, monitor, blur } => {
                     if monitor.is_empty() {
-                        // Global set: update global blur and clear overrides
                         state.default_image = Some(image.clone());
                         state.current_mode = mode.clone();
                         state.current_blur = blur;
                         state.monitor_overrides.clear();
                         state.per_monitor_blur.clear();
                     } else {
-                        // Per-monitor set: DO NOT touch current_blur, only update the map
                         state.monitor_overrides.insert(monitor.clone(), (image.clone(), mode.clone()));
                         state.per_monitor_blur.insert(monitor.clone(), blur);
                     }
@@ -578,7 +567,6 @@ pub fn run(
         }
     }).unwrap();
 
-    // Register worker response channel
     handle.insert_source(worker_rx, move |event, _, state| {
         match event {
             calloop::channel::Event::Msg(response) => {
@@ -606,13 +594,11 @@ pub fn run(
         }
     }).unwrap();
 
-    // Register signal handler for graceful shutdown
     let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT]).unwrap();
     handle.insert_source(signals, move |event, _, state| {
         let sig = event.signal();
         eprintln!("Received signal {:?}, shutting down gracefully...", sig);
 
-        // Clean up all Wayland surfaces
         for monitor in &mut state.monitors {
             if let Some(ls) = monitor.wallpaper.layer_surface.as_ref() { ls.destroy(); }
             if let Some(s) = monitor.wallpaper.surface.as_ref() { s.destroy(); }
@@ -620,13 +606,11 @@ pub fn run(
             if let Some(s) = monitor.backdrop.surface.as_ref() { s.destroy(); }
         }
 
-        // Stop the event loop
         if let Some(signal) = &state.loop_signal {
             signal.stop();
         }
     }).unwrap();
 
-    // Register Wayland connection fd
     let conn_source = conn.clone();
     handle.insert_source(
         Generic::new(conn_source, Interest::READ, Mode::Level),
@@ -652,12 +636,30 @@ pub fn run(
                                  }
                              }
 
+                             let mut any_rerender_needed = false;
+
                              for monitor in &mut state.monitors {
+                                 if monitor.wallpaper.needs_rerender || monitor.backdrop.needs_rerender {
+                                     monitor.wallpaper.needs_rerender = false;
+                                     monitor.backdrop.needs_rerender = false;
+                                     any_rerender_needed = true;
+                                 }
+
                                  if let Some(serial) = monitor.wallpaper.configure_serial.take() {
                                      if let Some(ls) = monitor.wallpaper.layer_surface.as_ref() { ls.ack_configure(serial); }
                                  }
                                  if let Some(serial) = monitor.backdrop.configure_serial.take() {
                                      if let Some(ls) = monitor.backdrop.layer_surface.as_ref() { ls.ack_configure(serial); }
+                                 }
+                             }
+
+                             if any_rerender_needed {
+                                 if let Some(tx) = &state.worker_tx {
+                                     let jobs = build_jobs(&state);
+                                     if !jobs.is_empty() {
+                                         let _ = tx.send(WorkerCommand::Process { jobs });
+                                         println!("Resolution changed, re-rendering...");
+                                     }
                                  }
                              }
 
@@ -673,7 +675,6 @@ pub fn run(
                          }
     ).unwrap();
 
-    // Run the event loop — sleeps at 0% CPU when idle
     event_loop.run(None, &mut state, |_state| {
         let _ = conn_idle.flush();
     }).unwrap();
